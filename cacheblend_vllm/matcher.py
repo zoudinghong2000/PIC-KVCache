@@ -7,7 +7,9 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-from .hashing import content_hash, rolling_hashes
+import numpy as np
+
+from .hashing import content_hash, rolling_hash_values
 from .types import BlendSegment, SegmentId
 
 
@@ -25,6 +27,7 @@ class TokenRangeMatcher:
             raise ValueError("chunk_size must be positive")
         self.chunk_size = chunk_size
         self._by_scope_hash: dict[tuple[str, int], list[FingerprintRecord]] = defaultdict(list)
+        self._scope_hashes: dict[str, set[int]] = defaultdict(set)
         self._by_id: dict[SegmentId, FingerprintRecord] = {}
         self._lock = threading.RLock()
 
@@ -57,6 +60,7 @@ class TokenRangeMatcher:
             self._by_id[record.segment_id] = record
             key = (record.segment_id.model_scope, record.segment_id.content_hash)
             self._by_scope_hash[key].append(record)
+            self._scope_hashes[record.segment_id.model_scope].add(record.segment_id.content_hash)
 
     def unregister(self, segment_id: SegmentId) -> None:
         with self._lock:
@@ -68,6 +72,10 @@ class TokenRangeMatcher:
             records[:] = [candidate for candidate in records if candidate.segment_id != segment_id]
             if not records:
                 del self._by_scope_hash[key]
+                scope_hashes = self._scope_hashes[segment_id.model_scope]
+                scope_hashes.discard(segment_id.content_hash)
+                if not scope_hashes:
+                    del self._scope_hashes[segment_id.model_scope]
 
     def match(
         self,
@@ -82,7 +90,19 @@ class TokenRangeMatcher:
         matches: list[BlendSegment] = []
         next_allowed = start_offset
         with self._lock:
-            for relative_start, value in rolling_hashes(suffix, self.chunk_size):
+            known_hashes = self._scope_hashes.get(model_scope)
+            if not known_hashes:
+                return ()
+            hashes = rolling_hash_values(suffix, self.chunk_size)
+            known = np.fromiter(
+                known_hashes,
+                dtype=np.uint64,
+                count=len(known_hashes),
+            )
+            candidate_starts = np.flatnonzero(np.isin(hashes, known))
+            for relative_start_value in candidate_starts:
+                relative_start = int(relative_start_value)
+                value = int(hashes[relative_start])
                 target_start = start_offset + relative_start
                 if target_start < next_allowed:
                     continue

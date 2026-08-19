@@ -19,7 +19,7 @@ The current target is deliberately narrow:
 Use the same Python environment as vLLM and vLLM-Ascend:
 
 ```bash
-python -m pip install --no-deps -e /home/zdh/cacheblend-vllm
+python -m pip install --no-deps -e .
 ```
 
 The package installs one vLLM general-plugin entry point. If `VLLM_PLUGINS` is
@@ -96,10 +96,39 @@ python -m pytest -q tests
 python -m pip wheel --no-deps -w /tmp/cacheblend-wheel .
 ```
 
-For an NPU acceptance run, compare APC and CacheBlend on the same prompt order,
-TP layout, model, and cache warm-up. Check output token equality/top-logprob
-agreement first, then TTFT and end-to-end latency. The handoff baseline uses
-Qwen3-30B-A3B TP2 with the defaults above.
+The smoke runner starts a real vLLM-Ascend server. With no request file it runs
+a short synthetic reuse case. Supplying a replay file enables the full runner;
+`REPLAY_SCRIPT` can point at a checkout other than the local default:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=2,3 \
+MODEL=/path/to/qwen3-30b-a3b \
+MAX_MODEL_LEN=98304 \
+MAX_NUM_BATCHED_TOKENS=8192 \
+LOCAL_CPU_GB=16 \
+REQUESTS_FILE=/path/to/requests.jsonl \
+bash scripts/run_npu_smoke.sh
+```
+
+## Validated result
+
+The standalone plugin was validated on 509 ordered requests using
+Qwen3-30B-A3B, Ascend TP2/EP2, PP1, 98,304 maximum model length, and a 16 GiB
+per-rank CPU cache. All 509 requests completed without an error. The records
+reported 1,916,004 external CacheBlend hit tokens and 10,909,568 native APC hit
+tokens.
+
+| Arm | Total TTFT | Median | p90 | p99 | External hits |
+|---|---:|---:|---:|---:|---:|
+| Standalone plugin | 378.334 s | 0.473 s | 1.754 s | 2.871 s | 1,916,004 |
+| LMCache-based CacheBlend baseline | 307.462 s | 0.349 s | 1.512 s | 2.776 s | 1,858,313 |
+| Native APC baseline | 337.026 s | 0.269 s | 2.009 s | 4.285 s | n/a |
+
+These are single-run acceptance figures, not a general benchmark. The plugin
+has slightly more external hits and better p90/p99 than APC on this trace, but
+its aggregate TTFT is currently 23.1% above the LMCache-based implementation
+and 12.3% above APC. Further work should target first-hit layerwise execution
+and the main-stream dependency at asynchronous writeback.
 
 ## Provenance
 

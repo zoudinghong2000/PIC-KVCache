@@ -43,7 +43,9 @@ def test_async_layer_reservation_is_unique_and_publishes_owned_host_tensor():
     segment_id = store.begin_put("m", 0, [1, 2, 3, 4], num_layers=1)
     assert store.reserve_layer(segment_id, 0)
     assert not store.reserve_layer(segment_id, 0)
-    host = torch.ones(2, 4, 2)
+    parent = torch.ones(2, 8, 2)
+    host = parent[:, 2:6]
+    assert not host.is_contiguous()
     assert store.put_layer_host(segment_id, 0, host)
     segment = store.match("m", [1, 2, 3, 4], 0)[0]
     store.pin("r", [segment])

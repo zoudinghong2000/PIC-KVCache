@@ -28,21 +28,32 @@ implementation; it is not a forward hook.
 ## Request lifecycle
 
 1. vLLM finds its normal APC prefix.
-2. CacheBlend searches fixed-size stored chunks at every token offset after
-   that prefix and leaves the last prompt token for the regular forward.
+2. CacheBlend computes all rolling fingerprints with vectorized `uint64`
+   arithmetic, intersects them with the scope's known hashes, verifies exact
+   token equality for candidates, and leaves the last prompt token for the
+   regular forward.
 3. TP workers validate and pin a common set of exact token matches.
 4. The scheduler reports the complete span through the standard external-token
    count, so vLLM allocates and owns every destination block.
 5. `start_load_kv` gathers the APC prefix, loads matched CPU segments, relocates
-   cached RoPE keys from source to target positions, and zeroes gaps.
+   cached RoPE keys from source to target positions with a direct delta
+   rotation, and zeroes gaps. On Ascend, native paged-cache gather/scatter ops
+   replace advanced indexing where their layout constraints are satisfied.
 6. The Qwen3 side executor runs the allocated suffix layer by layer. At a check
    layer it compares fresh K with cached K, globally selects high-error hits
    across TP ranks, and always retains gap tokens.
 7. Each completed layer is scattered into the vLLM-owned paged cache. The
    regular vLLM forward then computes the remaining prompt token and logits.
-8. Complete prompt chunks are gathered once per layer and asynchronously copied
-   into pinned CPU memory. Fingerprints are published atomically after all
+8. Complete prompt chunks are gathered once per layer on a dedicated NPU stream
+   and asynchronously copied into pinned CPU memory. Chunk identities are
+   hashed once per request, and stored tensor views retain their batch owner to
+   avoid a second CPU copy. Fingerprints are published atomically after all
    layers commit.
+
+The loader double-buffers its per-layer staging tensors. An event prevents a
+buffer from being reused until its previous layer has been scattered into the
+vLLM-owned pages, allowing the following layer's CPU-to-NPU transfer to overlap
+with model computation.
 
 ## Correctness invariants
 
@@ -72,4 +83,3 @@ The Connector API and scheduler metadata are pinned to vLLM/vLLM-Ascend 0.18.
 The first release supports Qwen3 dense/MoE, single-host TP1/TP2, and PP1. Adding
 another architecture requires a transparent registry adapter and a layerwise
 executor that preserves that model's attention, normalization, and MLP rules.
-

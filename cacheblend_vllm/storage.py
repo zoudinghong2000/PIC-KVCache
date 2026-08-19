@@ -125,11 +125,9 @@ class LocalPinnedCPUStore:
         layer_id: int,
         cpu_tensor: torch.Tensor,
     ) -> bool:
-        """Publish an owned, contiguous CPU tensor without another copy."""
+        """Publish an owned CPU tensor or view without another copy."""
         if cpu_tensor.device.type != "cpu":
             raise ValueError("put_layer_host requires a CPU tensor")
-        if not cpu_tensor.is_contiguous():
-            cpu_tensor = cpu_tensor.contiguous()
         with self._lock:
             entry = self._entries.get(segment_id)
             if entry is None:

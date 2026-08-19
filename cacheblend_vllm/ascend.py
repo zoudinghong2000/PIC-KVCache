@@ -53,17 +53,52 @@ def relocate_key(
     new_positions: torch.Tensor,
     key: torch.Tensor,
 ) -> torch.Tensor:
-    """Move an already-RoPE-encoded K tensor to new absolute positions."""
+    """Move an already-RoPE-encoded K tensor with one delta rotation.
+
+    Standard RoPE is a group rotation, so ``R(new) R(old)^-1`` can be applied
+    directly.  This avoids running the serving model's generic RoPE kernel
+    twice for every cached layer.
+    """
     if torch.equal(old_positions, new_positions):
         return key
     head_size = int(rotary_emb.head_size)
+    rotary_dim = int(getattr(rotary_emb, "rotary_dim", head_size))
     neox = bool(rotary_emb.is_neox_style)
-    flat = key.reshape(key.shape[0], -1)
-    shuffled = _shuffle_rope_halves(flat, head_size, neox)
-    _, inverse_once = rotary_emb(old_positions, shuffled, shuffled)
-    unrotated = _shuffle_rope_halves(inverse_once, head_size, neox)
-    _, relocated = rotary_emb(new_positions, unrotated, unrotated)
-    return relocated.reshape_as(key)
+    if not hasattr(rotary_emb, "cos_sin_cache"):
+        flat = key.reshape(key.shape[0], -1)
+        shuffled = _shuffle_rope_halves(flat, head_size, neox)
+        _, inverse_once = rotary_emb(old_positions, shuffled, shuffled)
+        unrotated = _shuffle_rope_halves(inverse_once, head_size, neox)
+        _, relocated = rotary_emb(new_positions, unrotated, unrotated)
+        return relocated.reshape_as(key)
+    cache = rotary_emb.cos_sin_cache.to(device=key.device, dtype=key.dtype)
+    old_cos_sin = cache.index_select(0, old_positions.flatten())
+    new_cos_sin = cache.index_select(0, new_positions.flatten())
+    old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
+    new_cos, new_sin = new_cos_sin.chunk(2, dim=-1)
+    delta_cos = new_cos * old_cos + new_sin * old_sin
+    delta_sin = new_sin * old_cos - new_cos * old_sin
+
+    original_shape = key.shape
+    shaped = key.reshape(key.shape[0], -1, head_size)
+    rotated, passthrough = shaped[..., :rotary_dim], shaped[..., rotary_dim:]
+    delta_cos = delta_cos.unsqueeze(1)
+    delta_sin = delta_sin.unsqueeze(1)
+    if neox:
+        first, second = torch.chunk(rotated, 2, dim=-1)
+        relocated = torch.cat(
+            (first * delta_cos - second * delta_sin, second * delta_cos + first * delta_sin),
+            dim=-1,
+        )
+    else:
+        first, second = rotated[..., ::2], rotated[..., 1::2]
+        relocated = torch.stack(
+            (first * delta_cos - second * delta_sin, second * delta_cos + first * delta_sin),
+            dim=-1,
+        ).flatten(-2)
+    if passthrough.numel():
+        relocated = torch.cat((relocated, passthrough), dim=-1)
+    return relocated.reshape(original_shape)
 
 
 @dataclass(slots=True)
@@ -97,6 +132,8 @@ class PagedBlendLoader:
         self.config = config
         self._buffers: dict[int, torch.Tensor] = {}
         self._events: dict[int, object] = {}
+        self._staging: list[torch.Tensor] = []
+        self._reuse_events: dict[int, object] = {}
         self._load_stream = None
         if _device_name() == "npu" and config.event_pipeline:
             self._load_stream = torch.npu.Stream()
@@ -108,15 +145,22 @@ class PagedBlendLoader:
         def load() -> None:
             kv_layer = self.kv_caches[layer_id]
             prefix = self.plan.apc_prefix_tokens
-            if prefix:
-                prefix_kv = gather_paged_kv(kv_layer, self.slot_mapping[:prefix], self.block_size)
-                shape = (2, self.plan.allocation_end, *prefix_kv.shape[2:])
-                buffer = torch.zeros(shape, dtype=prefix_kv.dtype, device=prefix_kv.device)
-                buffer[:, :prefix].copy_(prefix_kv)
-            else:
-                sample = gather_paged_kv(kv_layer, self.slot_mapping[:1], self.block_size)
+            sample_slots = self.slot_mapping[: prefix or 1]
+            sample = gather_paged_kv(kv_layer, sample_slots, self.block_size)
+            if not self._staging:
                 shape = (2, self.plan.allocation_end, *sample.shape[2:])
-                buffer = torch.zeros(shape, dtype=sample.dtype, device=sample.device)
+                self._staging = [
+                    torch.empty(shape, dtype=sample.dtype, device=sample.device),
+                    torch.empty(shape, dtype=sample.dtype, device=sample.device),
+                ]
+            buffer_index = layer_id % 2
+            reuse_event = self._reuse_events.pop(buffer_index, None)
+            if reuse_event is not None and self._load_stream is not None:
+                self._load_stream.wait_event(reuse_event)
+            buffer = self._staging[buffer_index]
+            if prefix:
+                buffer[:, :prefix].copy_(sample)
+            self._zero_gaps(buffer)
             if self.config.fused_segment_copy:
                 self._load_segments_fused(layer_id, rotary_emb, buffer)
             else:
@@ -131,6 +175,15 @@ class PagedBlendLoader:
             event = torch.npu.Event()
             event.record(self._load_stream)
             self._events[layer_id] = event
+
+    def _zero_gaps(self, buffer: torch.Tensor) -> None:
+        cursor = self.plan.apc_prefix_tokens
+        for segment in self.plan.segments:
+            if segment.target_start > cursor:
+                buffer[:, cursor : segment.target_start].zero_()
+            cursor = max(cursor, segment.target_end)
+        if cursor < self.plan.allocation_end:
+            buffer[:, cursor : self.plan.allocation_end].zero_()
 
     def _load_segments_individually(
         self,
@@ -196,7 +249,19 @@ class PagedBlendLoader:
         )
         device_kv = fused_host.to(device=buffer.device, non_blocking=True)
         device_kv[0] = relocate_key(rotary_emb, old_positions, new_positions, device_kv[0])
-        buffer[:, new_positions] = device_kv
+        if self.plan.allocation_end % self.block_size == 0:
+            paged = (
+                buffer[0].view(-1, self.block_size, *buffer.shape[2:]),
+                buffer[1].view(-1, self.block_size, *buffer.shape[2:]),
+            )
+            scatter_paged_kv(
+                device_kv,
+                paged,
+                new_positions,
+                self.block_size,
+            )
+        else:
+            buffer[:, new_positions] = device_kv
 
     def get(self, layer_id: int) -> torch.Tensor:
         event = self._events.pop(layer_id, None)
@@ -216,6 +281,10 @@ class PagedBlendLoader:
             self.slot_mapping[start:],
             self.block_size,
         )
+        if self._load_stream is not None:
+            event = torch.npu.Event()
+            event.record(torch.npu.current_stream())
+            self._reuse_events[layer_id % 2] = event
 
 
 class Qwen3BlendExecutor:

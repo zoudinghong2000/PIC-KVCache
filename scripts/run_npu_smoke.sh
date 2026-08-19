@@ -8,9 +8,20 @@ MODEL_NAME="${MODEL_NAME:-qwen3-coder-30b-a3b}"
 VLLM_PORT="${VLLM_PORT:-8123}"
 VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-2,3}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+LOCAL_CPU_GB="${LOCAL_CPU_GB:-1}"
+REQUESTS_FILE="${REQUESTS_FILE:-}"
+REPLAY_SCRIPT="${REPLAY_SCRIPT:-/home/zdh/mcts_kv_replay/replay_tree.py}"
+REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-1800}"
 STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-1200}"
+START_TURN="${START_TURN:-}"
+END_TURN="${END_TURN:-}"
 
 [[ -d "$MODEL" ]] || { echo "Missing model: $MODEL" >&2; exit 2; }
+if [[ -n "$REQUESTS_FILE" ]]; then
+  [[ -f "$REQUESTS_FILE" ]] || { echo "Missing requests: $REQUESTS_FILE" >&2; exit 2; }
+  [[ -f "$REPLAY_SCRIPT" ]] || { echo "Missing replay script: $REPLAY_SCRIPT" >&2; exit 2; }
+fi
 
 unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
 unset LMCACHE_CONFIG_FILE LMCACHE_LOG_LEVEL
@@ -57,7 +68,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-KV_CONFIG='{"kv_connector":"CacheBlendConnectorV1","kv_connector_module_path":"cacheblend_vllm.connector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"chunk_size":256,"local_cpu_gb":1,"min_retrieve_tokens":256,"min_hit_ratio":0.10,"check_layers":[1],"recompute_ratios":[0.15],"async_prefetch":true,"async_fingerprint":true,"tp_global_selection":true,"event_pipeline":true,"fused_segment_copy":true,"cache_attention_mask":true}}'
+KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"check_layers\":[1],\"recompute_ratios\":[0.15],\"async_prefetch\":true,\"async_fingerprint\":true,\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true}}"
 
 setsid vllm serve "$MODEL" \
   --host 127.0.0.1 \
@@ -69,7 +80,7 @@ setsid vllm serve "$MODEL" \
   --seed 0 \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-seqs 1 \
-  --max-num-batched-tokens 4096 \
+  --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --gpu-memory-utilization 0.85 \
   --trust-remote-code \
   --language-model-only \
@@ -96,7 +107,48 @@ done
 curl --noproxy '*' -fsS --max-time 2 "http://127.0.0.1:${VLLM_PORT}/health" >/dev/null
 echo "server healthy"
 
-python - "$VLLM_PORT" "$MODEL_NAME" <<'PY'
+if [[ -n "$REQUESTS_FILE" ]]; then
+  RECORDS="$SMOKE_DIR/records.jsonl"
+  REPLAY_RANGE_ARGS=()
+  [[ -z "$START_TURN" ]] || REPLAY_RANGE_ARGS+=(--start-turn "$START_TURN")
+  [[ -z "$END_TURN" ]] || REPLAY_RANGE_ARGS+=(--end-turn "$END_TURN")
+  python "$REPLAY_SCRIPT" \
+    --requests "$REQUESTS_FILE" \
+    --output "$RECORDS" \
+    --api-base "http://127.0.0.1:${VLLM_PORT}/v1" \
+    --metrics-url "http://127.0.0.1:${VLLM_PORT}/metrics" \
+    --model "$MODEL_NAME" \
+    --timeout "$REQUEST_TIMEOUT_SECONDS" \
+    --settle-seconds 0.05 \
+    --max-tokens 1 \
+    "${REPLAY_RANGE_ARGS[@]}"
+  python - "$RECORDS" "$SMOKE_DIR/summary.json" <<'PY'
+import json
+import statistics
+import sys
+from pathlib import Path
+
+records_path, summary_path = sys.argv[1:]
+rows = [json.loads(line) for line in Path(records_path).read_text().splitlines() if line]
+ttfts = [float(row["ttft_seconds"]) for row in rows if "error" not in row]
+metrics = {}
+for row in rows:
+    for name, value in row.get("metrics_delta", {}).items():
+        metrics[name] = metrics.get(name, 0.0) + value
+summary = {
+    "request_count": len(rows),
+    "error_count": sum("error" in row for row in rows),
+    "prompt_tokens": sum(row.get("usage", {}).get("prompt_tokens", 0) for row in rows),
+    "total_ttft_seconds": sum(ttfts),
+    "median_ttft_seconds": statistics.median(ttfts) if ttfts else None,
+    "total_request_seconds": sum(row.get("total_seconds", 0.0) for row in rows),
+    "metrics_delta": dict(sorted(metrics.items())),
+}
+Path(summary_path).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+print(json.dumps(summary, indent=2, sort_keys=True))
+PY
+else
+  python - "$VLLM_PORT" "$MODEL_NAME" <<'PY'
 import json
 import sys
 import time
@@ -138,6 +190,7 @@ for line in metrics.splitlines():
     if "external_prefix_cache" in line and not line.startswith("#"):
         print("metric", line)
 PY
+fi
 
 echo "CacheBlend log lines:"
 rg -n "CacheBlend|cacheblend" "$SERVER_LOG" | tail -n 80 || true
