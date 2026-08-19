@@ -1,0 +1,8 @@
+CacheBlend vLLM plugin
+Copyright 2026 zoudinghong2000
+
+This product includes software developed by contributors to LMCache and
+LMCache-Ascend, licensed under the Apache License, Version 2.0. CacheBlend
+token-range lookup, layerwise blending, and Ascend transfer behavior were
+derived from LMCache commit da5c247b and LMCache-Ascend commit 903bab1.
+

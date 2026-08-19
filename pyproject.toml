@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cacheblend-vllm"
+version = "0.1.0"
+description = "Out-of-tree CacheBlend V1 connector for vLLM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "zoudinghong2000", email = "windwindzzz@gmail.com"}]
+dependencies = [
+  "numpy>=1.26",
+  "pyzmq>=25",
+  "torch>=2.9,<2.10",
+  "vllm>=0.18,<0.19",
+]
+
+[project.optional-dependencies]
+ascend = [
+  "torch-npu>=2.9,<2.10",
+  "vllm-ascend>=0.18,<0.19",
+]
+test = ["pytest>=8", "pytest-timeout>=2"]
+
+[project.entry-points."vllm.general_plugins"]
+cacheblend_models = "cacheblend_vllm.plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["cacheblend_vllm*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
