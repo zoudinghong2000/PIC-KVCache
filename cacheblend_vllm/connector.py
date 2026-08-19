@@ -116,8 +116,12 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._save_futures: set[Future[bool]] = set()
         self._save_segments: dict[str, list[tuple[int, SegmentId]]] = {}
         self._save_lock = threading.Lock()
-        self._store_stream: Any | None = None
-        self._last_save_event: Any | None = None
+        self._pending_offloads: list[
+            tuple[list[tuple[Any, int, int]], torch.Tensor]
+        ] = []
+        self._gather_stream: Any | None = None
+        self._offload_stream: Any | None = None
+        self._last_gather_event: Any | None = None
         # A Qwen3 request emits one transfer per layer.  Keep enough pinned
         # buffers for two full layer stacks so wait_for_save can remain a
         # non-blocking enqueue boundary instead of serializing every prefill.
@@ -168,7 +172,15 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         first_cache = self._kv_caches[0]
         first_tensor = first_cache if isinstance(first_cache, torch.Tensor) else first_cache[0]
         if first_tensor.device.type == "npu":
-            self._store_stream = torch.npu.Stream()
+            # Keep reads from vLLM's paged cache separate from the slower D2H
+            # transfer.  vLLM only has to wait until the gather stream has
+            # stopped touching its blocks; the offload stream owns the
+            # independent contiguous staging tensor after that point.
+            # Ascend exposes priority -1 as the high-priority stream.  Page
+            # reads are on vLLM's critical reuse path, while D2H writeback is
+            # deliberately best effort on the default-priority stream.
+            self._gather_stream = torch.npu.Stream(priority=-1)
+            self._offload_stream = torch.npu.Stream()
         model = get_model(self.engine_id)
         self._executor = Qwen3BlendExecutor(model, self.config)
         logger.info(
@@ -269,7 +281,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 continue
             try:
                 slots = torch.cat(slot_parts)
-                if self._store_stream is None:
+                if self._gather_stream is None:
                     contiguous = gather_paged_kv(
                         kv_layer,
                         slots,
@@ -278,14 +290,21 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                     self._save_contiguous_batch(pending, contiguous)
                 else:
                     current_stream = torch.npu.current_stream()
-                    with torch.npu.stream(self._store_stream):
-                        self._store_stream.wait_stream(current_stream)
+                    with torch.npu.stream(self._gather_stream):
+                        self._gather_stream.wait_stream(current_stream)
                         contiguous = gather_paged_kv(
                             kv_layer,
                             slots,
                             self.block_size,
                         ).contiguous()
-                        self._save_contiguous_batch(pending, contiguous)
+                        gather_event = torch.npu.Event()
+                        gather_event.record(self._gather_stream)
+                    self._last_gather_event = gather_event
+                    # Do not start D2H while the same request is still running
+                    # model layers. wait_for_save enqueues these transfers
+                    # behind an end-of-forward barrier without waiting for
+                    # their completion.
+                    self._pending_offloads.append((pending, contiguous))
             except Exception:
                 for segment_id, reserved_layer_id, _ in pending:
                     self._store.cancel_layer(segment_id, reserved_layer_id)
@@ -316,6 +335,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self,
         pending: list[tuple[Any, int, int]],
         contiguous: torch.Tensor,
+        ready_event: Any | None = None,
     ) -> None:
         assert self._store is not None
         if contiguous.device.type != "npu" or not self.config.async_fingerprint:
@@ -331,16 +351,21 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 device="cpu",
                 pin_memory=True,
             )
-            host.copy_(contiguous, non_blocking=True)
-            event = torch.npu.Event()
-            event.record(torch.npu.current_stream())
-            self._last_save_event = event
+            if self._offload_stream is None:
+                raise RuntimeError("CacheBlend NPU offload stream was not initialized")
+            with torch.npu.stream(self._offload_stream):
+                if ready_event is not None:
+                    self._offload_stream.wait_event(ready_event)
+                host.copy_(contiguous, non_blocking=True)
+                offload_event = torch.npu.Event()
+                offload_event.record(self._offload_stream)
             assert self._save_pool is not None
             future = self._save_pool.submit(
                 self._publish_after_event,
-                event,
+                offload_event,
                 pending,
                 host,
+                contiguous,
             )
         except Exception:
             self._save_slots.release()
@@ -371,10 +396,16 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         event: Any,
         pending: list[tuple[Any, int, int]],
         host: torch.Tensor,
+        device_source: torch.Tensor,
     ) -> bool:
         assert self._store is not None
         try:
             event.synchronize()
+            # ``device_source`` is intentionally held by this future until the
+            # offload event completes.  Dropping the last reference sooner can
+            # let the caching allocator recycle staging while D2H still reads
+            # it on the offload stream.
+            del device_source
             return self._publish_host_batch(pending, host)
         except Exception:
             for segment_id, layer_id, _ in pending:
@@ -385,16 +416,40 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._save_slots.release()
 
     def wait_for_save(self) -> None:
-        """Reap completed D2H jobs without stalling the serving stream.
+        """Protect paged KV reuse without waiting for CPU writeback.
 
-        Device copies and their completion events were enqueued on the current
-        NPU stream by ``save_kv_layer``.  The pinned destination tensors remain
-        owned by their futures, so vLLM may safely advance to the next request.
+        The gather stream is the last consumer of vLLM's paged blocks, so the
+        serving stream only waits for its final event.  D2H continues on the
+        offload stream from an independent staging tensor held by the Future.
         Entries become lookup-visible only after every layer has completed.
         """
-        if self._last_save_event is not None:
-            torch.npu.current_stream().wait_event(self._last_save_event)
-            self._last_save_event = None
+        pending_offloads = self._pending_offloads
+        self._pending_offloads = []
+        offload_ready_event = None
+        if self._last_gather_event is not None:
+            current_stream = torch.npu.current_stream()
+            current_stream.wait_event(self._last_gather_event)
+            self._last_gather_event = None
+            if pending_offloads:
+                # Record after all forward work already submitted to the
+                # serving stream and after its gather dependency.  D2H can run
+                # in the background once this barrier completes, but never
+                # competes with the miss request that produced the cache.
+                offload_ready_event = torch.npu.Event()
+                offload_ready_event.record(current_stream)
+        for index, (pending, contiguous) in enumerate(pending_offloads):
+            try:
+                self._save_contiguous_batch(
+                    pending,
+                    contiguous,
+                    ready_event=offload_ready_event,
+                )
+            except Exception:
+                assert self._store is not None
+                for unscheduled, _ in pending_offloads[index:]:
+                    for segment_id, layer_id, _ in unscheduled:
+                        self._store.cancel_layer(segment_id, layer_id)
+                raise
         with self._save_lock:
             futures = tuple(future for future in self._save_futures if future.done())
         for future in futures:

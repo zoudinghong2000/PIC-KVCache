@@ -27,3 +27,14 @@ def test_gather_and_scatter_round_trip(layout):
 def test_rejects_unknown_layout():
     with pytest.raises(ValueError, match="unsupported"):
         gather_paged_kv(torch.empty(3, 4, 5), torch.tensor([0]), 2)
+
+
+def test_gather_can_fill_reusable_output():
+    paged = torch.arange(2 * 3 * 2 * 2, dtype=torch.float32).reshape(2, 3, 2, 2)
+    slots = torch.tensor([0, 3, 4])
+    out = torch.empty(2, 3, 2)
+
+    result = gather_paged_kv(paged, slots, 2, out=out)
+
+    assert result is out
+    assert torch.equal(out, paged[:, [0, 1, 2], [0, 1, 0]])

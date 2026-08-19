@@ -29,6 +29,7 @@ def _gather_ascend_separate(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_size: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Use CANN's paged-cache gather instead of NPU advanced indexing.
 
@@ -46,6 +47,10 @@ def _gather_ascend_separate(
     slots_cpu = slot_mapping.detach().to(device="cpu", dtype=torch.long)
     if slots_cpu.numel() == 0:
         shape = (2, 0, *key_cache.shape[2:])
+        if out is not None:
+            if tuple(out.shape) != shape:
+                raise ValueError(f"gather output has shape {tuple(out.shape)}, expected {shape}")
+            return out
         return torch.empty(shape, dtype=key_cache.dtype, device=key_cache.device)
     blocks = slots_cpu // block_size
     offsets = slots_cpu % block_size
@@ -60,12 +65,16 @@ def _gather_ascend_separate(
     block_table = logical_blocks.to(device=device, dtype=torch.int32).unsqueeze(0)
     context_lens = torch.tensor([slots_cpu.numel()], dtype=torch.int32, device=device)
     seq_starts = offsets[:1].to(device=device, dtype=torch.int32)
-    key = torch.empty(
-        (slots_cpu.numel(), *key_cache.shape[2:]),
-        dtype=key_cache.dtype,
-        device=device,
-    )
-    value = torch.empty_like(key)
+    shape = (2, slots_cpu.numel(), *key_cache.shape[2:])
+    if out is None:
+        result = torch.empty(shape, dtype=key_cache.dtype, device=device)
+    else:
+        if tuple(out.shape) != shape:
+            raise ValueError(f"gather output has shape {tuple(out.shape)}, expected {shape}")
+        if out.dtype != key_cache.dtype or out.device != device:
+            raise ValueError("gather output must match the KV cache dtype and device")
+        result = out
+    key, value = result[0], result[1]
     torch_npu.atb.npu_paged_cache_load(
         key_cache,
         value_cache,
@@ -75,32 +84,42 @@ def _gather_ascend_separate(
         key=key,
         value=value,
     )
-    return torch.stack((key, value), dim=0)
+    return result
 
 
 def gather_paged_kv(
     kv_layer: KVLayer,
     slot_mapping: torch.Tensor,
     block_size: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather paged KV as contiguous ``[2, tokens, ...]``."""
     separate = _separate(kv_layer)
     if separate is not None:
         key, value = separate
-        native = _gather_ascend_separate(key, value, slot_mapping, block_size)
+        native = _gather_ascend_separate(key, value, slot_mapping, block_size, out)
         if native is not None:
             return native
         slots = _slots(slot_mapping, key.device)
         blocks, offsets = slots // block_size, slots % block_size
-        return torch.stack((key[blocks, offsets], value[blocks, offsets]), dim=0)
+        result = torch.stack((key[blocks, offsets], value[blocks, offsets]), dim=0)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
     assert isinstance(kv_layer, torch.Tensor)
     slots = _slots(slot_mapping, kv_layer.device)
     blocks, offsets = slots // block_size, slots % block_size
     if kv_layer.shape[0] == 2:
-        return kv_layer[:, blocks, offsets]
-    if kv_layer.ndim >= 4 and kv_layer.shape[1] == 2:
-        return kv_layer[blocks, :, offsets].transpose(0, 1)
-    raise ValueError(f"unsupported vLLM KV layout {tuple(kv_layer.shape)}")
+        result = kv_layer[:, blocks, offsets]
+    elif kv_layer.ndim >= 4 and kv_layer.shape[1] == 2:
+        result = kv_layer[blocks, :, offsets].transpose(0, 1)
+    else:
+        raise ValueError(f"unsupported vLLM KV layout {tuple(kv_layer.shape)}")
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def scatter_paged_kv(

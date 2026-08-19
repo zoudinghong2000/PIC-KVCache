@@ -119,22 +119,23 @@ bash scripts/run_npu_smoke.sh
 The standalone plugin was validated on 509 ordered requests using
 Qwen3-30B-A3B, Ascend TP2/EP2, PP1, 98,304 maximum model length, and a 16 GiB
 per-rank CPU cache. All 509 requests completed without an error. The records
-reported a 1,755,107-token external CacheBlend allocation span and 10,909,568
+reported a 1,754,152-token external CacheBlend allocation span and 10,909,568
 native APC hit tokens. The external metric is the scheduler-owned continuous
 span and can include recomputed gaps; it is not the exact-hit count.
 
 | Arm | Total TTFT | Median | p90 | p99 | External span |
 |---|---:|---:|---:|---:|---:|
-| Standalone plugin | 320.827 s | 0.406 s | 1.588 s | 2.568 s | 1,755,107 |
+| Standalone plugin | 317.541 s | 0.403 s | 1.510 s | 2.886 s | 1,754,152 |
 | LMCache-based CacheBlend baseline | 307.462 s | 0.349 s | 1.512 s | 2.776 s | 1,858,313 |
 | Native APC baseline | 337.026 s | 0.269 s | 2.009 s | 4.285 s | n/a |
 
 These are single-run acceptance figures, not a general benchmark. Profitability
-gating, direct segment-to-NPU staging, and suffix-only persistent TP lookup cut
-the plugin's previous 378.334-second result by 15.2%. It is 4.8% faster than
-native APC on this trace and remains 4.3% above the LMCache-based implementation.
-The remaining aggregate gap is concentrated in lookup-miss writeback and its
-main-stream dependency.
+gating, direct segment-to-NPU staging, suffix-only persistent TP lookup, and
+two-stream asynchronous writeback cut the plugin's previous 378.334-second
+result by 16.1%. It is 5.8% faster than native APC on this trace and remains
+3.3% above the LMCache-based implementation. Compared with the immediately
+preceding 320.827-second plugin run, decoupling paged-KV gather from background
+D2H reduced total TTFT by 1.0% while completing all requests without an error.
 
 ## Provenance
 
