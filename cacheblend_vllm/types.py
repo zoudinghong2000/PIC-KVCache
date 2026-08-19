@@ -129,12 +129,19 @@ class BlendPlan:
         min_retrieve_tokens: int,
         min_hit_ratio: float,
         min_saved_tokens: int,
+        max_apc_prefix_to_hit_ratio: float = 0.0,
     ) -> bool:
         if self.hit_tokens < min_retrieve_tokens:
             return False
         if self.hit_tokens < min_saved_tokens:
             return False
-        return self.hit_tokens / max(self.allocation_tokens, 1) >= min_hit_ratio
+        if self.hit_tokens / max(self.allocation_tokens, 1) < min_hit_ratio:
+            return False
+        return not (
+            max_apc_prefix_to_hit_ratio > 0
+            and self.apc_prefix_tokens / max(self.hit_tokens, 1)
+            > max_apc_prefix_to_hit_ratio
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {

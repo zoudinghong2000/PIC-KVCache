@@ -134,6 +134,17 @@ class PagedBlendLoader:
         self._events: dict[int, object] = {}
         self._staging: list[torch.Tensor] = []
         self._reuse_events: dict[int, object] = {}
+        self._hit_staging: torch.Tensor | None = None
+        self._device_positions: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._old_positions_cpu = torch.cat(
+            [
+                torch.arange(segment.source_start, segment.source_start + segment.length)
+                for segment in self.plan.segments
+            ]
+        )
+        self._new_positions_cpu = torch.cat(
+            [torch.arange(segment.target_start, segment.target_end) for segment in self.plan.segments]
+        )
         self._load_stream = None
         if _device_name() == "npu" and config.event_pipeline:
             self._load_stream = torch.npu.Stream()
@@ -222,32 +233,37 @@ class PagedBlendLoader:
         if not hosts:
             return
         shape = (2, self.plan.hit_tokens, *hosts[0].shape[2:])
-        try:
-            fused_host = torch.empty(
+        if self._hit_staging is None:
+            self._hit_staging = torch.empty(
                 shape,
                 dtype=hosts[0].dtype,
-                device="cpu",
-                pin_memory=True,
+                device=buffer.device,
             )
-        except RuntimeError:
-            fused_host = torch.empty(shape, dtype=hosts[0].dtype, device="cpu")
+        device_kv = self._hit_staging
         offset = 0
-        old_position_parts: list[torch.Tensor] = []
-        new_position_parts: list[torch.Tensor] = []
         for host, segment in zip(hosts, self.plan.segments, strict=True):
-            fused_host[:, offset : offset + segment.length].copy_(host)
-            old_position_parts.append(
-                torch.arange(segment.source_start, segment.source_start + segment.length)
-            )
-            new_position_parts.append(torch.arange(segment.target_start, segment.target_end))
+            end = offset + segment.length
+            # Saved chunks are views into a larger pinned batch. Their K and V
+            # planes are contiguous even when the combined [2, T, ...] view is
+            # not. Copy the two planes directly into reusable NPU staging and
+            # avoid constructing a second fused CPU buffer for every layer.
+            device_kv[0, offset:end].copy_(host[0], non_blocking=True)
+            device_kv[1, offset:end].copy_(host[1], non_blocking=True)
             offset += segment.length
-        old_positions = torch.cat(old_position_parts).to(
-            device=buffer.device, dtype=torch.long, non_blocking=True
-        )
-        new_positions = torch.cat(new_position_parts).to(
-            device=buffer.device, dtype=torch.long, non_blocking=True
-        )
-        device_kv = fused_host.to(device=buffer.device, non_blocking=True)
+        if self._device_positions is None:
+            self._device_positions = (
+                self._old_positions_cpu.to(
+                    device=buffer.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                ),
+                self._new_positions_cpu.to(
+                    device=buffer.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                ),
+            )
+        old_positions, new_positions = self._device_positions
         device_kv[0] = relocate_key(rotary_emb, old_positions, new_positions, device_kv[0])
         if self.plan.allocation_end % self.block_size == 0:
             paged = (

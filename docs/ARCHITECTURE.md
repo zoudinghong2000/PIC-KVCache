@@ -5,11 +5,16 @@ plugin interfaces. Upstream vLLM and vLLM-Ascend do not need patches.
 
 ## Process boundaries
 
-The scheduler-side Connector owns asynchronous lookup futures and lightweight
+The scheduler-side Connector owns synchronous local lookup state and lightweight
 request/block trackers. Each TP worker owns an independent pinned-CPU store and
 a local Unix-socket lookup server. Rank 0 proposes token-range matches; every
 rank validates and pins the exact intersection before the scheduler allocates
 the corresponding vLLM pages.
+
+Lookup clients keep one REQ socket per rank for the engine lifetime. The
+scheduler sends only the token suffix not already covered by APC, sends rank
+validation/pin messages before receiving any reply, and therefore overlaps TP
+worker processing without sharing a ZeroMQ socket across threads.
 
 The stores deliberately do not share KV tensors between TP ranks. A segment ID
 is common across ranks, while its stored tensor contains that rank's KV shard.
@@ -33,18 +38,21 @@ implementation; it is not a forward hook.
    token equality for candidates, and leaves the last prompt token for the
    regular forward.
 3. TP workers validate and pin a common set of exact token matches.
-4. The scheduler reports the complete span through the standard external-token
+4. A cost gate rejects small exact-hit sets and cases where the native APC
+   prefix is disproportionately larger than the reuse. Rejected requests stay
+   on vLLM's normal APC path.
+5. The scheduler reports the complete span through the standard external-token
    count, so vLLM allocates and owns every destination block.
-5. `start_load_kv` gathers the APC prefix, loads matched CPU segments, relocates
+6. `start_load_kv` gathers the APC prefix, loads matched CPU segments, relocates
    cached RoPE keys from source to target positions with a direct delta
    rotation, and zeroes gaps. On Ascend, native paged-cache gather/scatter ops
    replace advanced indexing where their layout constraints are satisfied.
-6. The Qwen3 side executor runs the allocated suffix layer by layer. At a check
+7. The Qwen3 side executor runs the allocated suffix layer by layer. At a check
    layer it compares fresh K with cached K, globally selects high-error hits
    across TP ranks, and always retains gap tokens.
-7. Each completed layer is scattered into the vLLM-owned paged cache. The
+8. Each completed layer is scattered into the vLLM-owned paged cache. The
    regular vLLM forward then computes the remaining prompt token and logits.
-8. Complete prompt chunks are gathered once per layer on a dedicated NPU stream
+9. Complete prompt chunks are gathered once per layer on a dedicated NPU stream
    and asynchronously copied into pinned CPU memory. Chunk identities are
    hashed once per request, and stored tensor views retain their batch owner to
    avoid a second CPU copy. Fingerprints are published atomically after all
@@ -53,7 +61,10 @@ implementation; it is not a forward hook.
 The loader double-buffers its per-layer staging tensors. An event prevents a
 buffer from being reused until its previous layer has been scattered into the
 vLLM-owned pages, allowing the following layer's CPU-to-NPU transfer to overlap
-with model computation.
+with model computation. Matched pinned-CPU chunks copy their contiguous K and V
+planes directly into one reusable NPU hit buffer; source/target position tensors
+are built once per request. This follows LMCache-Ascend's fused-transfer layout
+without importing its runtime or rebuilding a fused CPU tensor for every layer.
 
 ## Correctness invariants
 

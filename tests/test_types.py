@@ -15,6 +15,9 @@ def test_blend_plan_round_trip_and_gaps():
     assert BlendPlan.from_dict(plan.to_dict()) == plan
     assert plan.passes_gate(4, 0.5, 0)
     assert not plan.passes_gate(4, 0.75, 0)
+    assert not plan.passes_gate(4, 0.5, 9)
+    assert not plan.passes_gate(4, 0.5, 0, 0.49)
+    assert plan.passes_gate(4, 0.5, 0, 0.5)
 
 
 def test_blend_plan_rejects_overlaps():

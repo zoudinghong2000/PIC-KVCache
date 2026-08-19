@@ -487,6 +487,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             self.config.min_retrieve_tokens,
             self.config.min_hit_ratio,
             self.config.min_saved_tokens,
+            self.config.max_apc_prefix_to_hit_ratio,
         ):
             logger.info(
                 "CacheBlend plan rejected request=%s apc=%d span=%d hits=%d segments=%d",
@@ -687,6 +688,9 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         if self._server is not None:
             self._server.close()
             self._server = None
+        if self._lookup is not None:
+            self._lookup.close()
+            self._lookup = None
         if self._store is not None:
             self._store.clear()
 

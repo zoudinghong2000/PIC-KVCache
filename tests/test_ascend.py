@@ -60,8 +60,15 @@ def test_loader_preserves_apc_prefix_zeroes_gaps_and_scatter_suffix():
     original_prefix = paged[:, 0, :2].clone()
     store = LocalPinnedCPUStore(2, 4096, pin_memory=False)
     segment_id = store.begin_put("m", 4, [7, 8], num_layers=1)
-    host = torch.tensor([[[[70.0]], [[80.0]]], [[[700.0]], [[800.0]]]])
-    store.put_layer(segment_id, 0, host)
+    host_parent = torch.tensor(
+        [
+            [[[0.0]], [[70.0]], [[80.0]], [[0.0]]],
+            [[[0.0]], [[700.0]], [[800.0]], [[0.0]]],
+        ]
+    )
+    host = host_parent[:, 1:3]
+    assert not host.is_contiguous()
+    store.put_layer_host(segment_id, 0, host)
     segment = BlendSegment(segment_id, target_start=4)
     store.pin("r", [segment])
     plan = BlendPlan(apc_prefix_tokens=2, allocation_end=6, hit_tokens=2, segments=(segment,))

@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import zmq
 
 from .storage import LocalPinnedCPUStore
@@ -69,10 +70,13 @@ class LookupServer:
     def close(self) -> None:
         self._stop.set()
         if self._thread.is_alive():
+            client = LookupClient(self.uri, timeout_ms=500)
             try:
-                LookupClient(self.uri, timeout_ms=500).request({"op": "SHUTDOWN"})
-            except (RuntimeError, zmq.ZMQError):
+                client.request({"op": "SHUTDOWN"})
+            except (RuntimeError, TypeError, zmq.ZMQError):
                 logger.debug("Lookup server %s was already closed", self.uri)
+            finally:
+                client.close()
             self._thread.join(timeout=2)
         if self.path is not None:
             self.path.unlink(missing_ok=True)
@@ -105,9 +109,15 @@ class LookupServer:
             self._stop.set()
             return {"ok": True}
         if operation == "MATCH":
+            raw_tokens = message["tokens"]
+            tokens = (
+                raw_tokens
+                if isinstance(raw_tokens, np.ndarray)
+                else np.asarray(raw_tokens, dtype=np.int64)
+            )
             segments = self.store.match(
                 str(message["model_scope"]),
-                [int(token) for token in message["tokens"]],
+                tokens,
                 int(message["start_offset"]),
             )
             return {"ok": True, "segments": [segment.to_dict() for segment in segments]}
@@ -125,25 +135,51 @@ class LookupServer:
 
 
 class LookupClient:
+    """Persistent REQ client with LMCache-style recovery after an RPC error."""
+
     def __init__(self, uri: str, timeout_ms: int = 10_000):
         self.uri = uri
         self.timeout_ms = timeout_ms
         self._context = zmq.Context.instance()
+        self._socket = self._create_socket()
 
-    def request(self, message: dict[str, Any]) -> dict[str, Any]:
+    def _create_socket(self) -> zmq.Socket:
         socket = self._context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
         socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
         socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
+        socket.connect(self.uri)
+        return socket
+
+    def reset(self) -> None:
+        self._socket.close(0)
+        self._socket = self._create_socket()
+
+    def close(self) -> None:
+        self._socket.close(0)
+
+    def send(self, message: dict[str, Any]) -> None:
         try:
-            socket.connect(self.uri)
-            socket.send_pyobj(message)
-            response = socket.recv_pyobj()
-        finally:
-            socket.close(0)
+            self._socket.send_pyobj(message)
+        except zmq.ZMQError:
+            self.reset()
+            raise
+
+    def receive(self) -> dict[str, Any]:
+        try:
+            response = self._socket.recv_pyobj()
+        except zmq.ZMQError:
+            self.reset()
+            raise
+        if not isinstance(response, dict):
+            raise TypeError(f"invalid CacheBlend RPC response {type(response)!r}")
         if not response.get("ok"):
             raise RuntimeError(response.get("error", "CacheBlend lookup RPC failed"))
         return response
+
+    def request(self, message: dict[str, Any]) -> dict[str, Any]:
+        self.send(message)
+        return self.receive()
 
 
 class TensorParallelLookup:
@@ -154,6 +190,24 @@ class TensorParallelLookup:
         if not self.clients:
             raise ValueError("at least one TP lookup endpoint is required")
 
+    @staticmethod
+    def _request_all(
+        clients: Iterable[LookupClient],
+        message: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Send to every rank before receiving, allowing rank work to overlap."""
+        selected = tuple(clients)
+        try:
+            for client in selected:
+                client.send(message)
+            return [client.receive() for client in selected]
+        except Exception:
+            # A REQ socket with an outstanding or failed request cannot be
+            # reused. Reset the whole group to restore a consistent state.
+            for client in selected:
+                client.reset()
+            raise
+
     def lookup_and_prefetch(
         self,
         request_id: str,
@@ -161,23 +215,39 @@ class TensorParallelLookup:
         tokens: list[int],
         start_offset: int,
     ) -> tuple[BlendSegment, ...]:
+        # Native APC already owns the prefix. Sending only the suffix avoids
+        # serializing tens of thousands of irrelevant token IDs on every
+        # scheduler lookup. A NumPy payload is pickled as one binary buffer.
+        token_suffix = np.asarray(tokens[start_offset:], dtype=np.int64)
         matched = self.clients[0].request(
             {
                 "op": "MATCH",
                 "model_scope": model_scope,
-                "tokens": tokens,
-                "start_offset": start_offset,
+                "tokens": token_suffix,
+                "start_offset": 0,
             }
         )
-        candidates = tuple(BlendSegment.from_dict(value) for value in matched.get("segments", []))
+        candidates = tuple(
+            BlendSegment(
+                segment.segment_id,
+                segment.target_start + start_offset,
+            )
+            for segment in (
+                BlendSegment.from_dict(value) for value in matched.get("segments", [])
+            )
+        )
         if not candidates:
             return ()
 
         common = set(candidates)
-        for client in self.clients:
-            response = client.request(
-                {"op": "VALIDATE", "segments": [value.to_dict() for value in candidates]}
-            )
+        segment_payload = [value.to_dict() for value in candidates]
+        # Rank 0 just produced the candidates. Other ranks validate in
+        # parallel; PREFETCH below atomically revalidates and pins every rank.
+        responses = self._request_all(
+            self.clients[1:],
+            {"op": "VALIDATE", "segments": segment_payload},
+        )
+        for response in responses:
             common.intersection_update(
                 BlendSegment.from_dict(value) for value in response.get("segments", [])
             )
@@ -185,19 +255,19 @@ class TensorParallelLookup:
         if not final:
             return ()
 
-        pinned_sets: list[set[BlendSegment]] = []
         try:
-            for client in self.clients:
-                response = client.request(
-                    {
-                        "op": "PREFETCH",
-                        "request_id": request_id,
-                        "segments": [value.to_dict() for value in final],
-                    }
-                )
-                pinned_sets.append(
-                    {BlendSegment.from_dict(value) for value in response.get("segments", [])}
-                )
+            responses = self._request_all(
+                self.clients,
+                {
+                    "op": "PREFETCH",
+                    "request_id": request_id,
+                    "segments": [value.to_dict() for value in final],
+                },
+            )
+            pinned_sets = [
+                {BlendSegment.from_dict(value) for value in response.get("segments", [])}
+                for response in responses
+            ]
             pinned_common = set(final)
             for pinned in pinned_sets:
                 pinned_common.intersection_update(pinned)
@@ -210,8 +280,14 @@ class TensorParallelLookup:
             raise
 
     def cancel(self, request_id: str) -> None:
+        try:
+            self._request_all(
+                self.clients,
+                {"op": "CANCEL", "request_id": request_id},
+            )
+        except (RuntimeError, TypeError, zmq.ZMQError):
+            logger.warning("Failed to release CacheBlend request %s", request_id)
+
+    def close(self) -> None:
         for client in self.clients:
-            try:
-                client.request({"op": "CANCEL", "request_id": request_id})
-            except (RuntimeError, zmq.ZMQError):
-                logger.warning("Failed to release CacheBlend request %s", request_id)
+            client.close()

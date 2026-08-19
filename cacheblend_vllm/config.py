@@ -12,7 +12,11 @@ class CacheBlendConfig:
     local_cpu_gb: float = 16.0
     min_retrieve_tokens: int = 256
     min_hit_ratio: float = 0.10
-    min_saved_tokens: int = 0
+    # A 48-layer side forward has a material fixed cost on Ascend. The full
+    # replay turns profitable at roughly 8K exact hits, so reject tiny matches
+    # by default instead of doing more work than native APC.
+    min_saved_tokens: int = 8192
+    max_apc_prefix_to_hit_ratio: float = 8.0
     check_layers: tuple[int, ...] = (1,)
     recompute_ratios: tuple[float, ...] = (0.15,)
     save_decode_cache: bool = False
@@ -52,6 +56,8 @@ class CacheBlendConfig:
             raise ValueError("token thresholds cannot be negative")
         if not 0.0 <= self.min_hit_ratio <= 1.0:
             raise ValueError("min_hit_ratio must be between 0 and 1")
+        if self.max_apc_prefix_to_hit_ratio < 0:
+            raise ValueError("max_apc_prefix_to_hit_ratio cannot be negative")
         if not self.check_layers:
             raise ValueError("at least one check layer is required")
         if len(self.recompute_ratios) not in (1, len(self.check_layers)):

@@ -68,7 +68,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"check_layers\":[1],\"recompute_ratios\":[0.15],\"async_prefetch\":true,\"async_fingerprint\":true,\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true}}"
+KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":8192,\"max_apc_prefix_to_hit_ratio\":8.0,\"check_layers\":[1],\"recompute_ratios\":[0.15],\"async_prefetch\":true,\"async_fingerprint\":true,\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true}}"
 
 setsid vllm serve "$MODEL" \
   --host 127.0.0.1 \

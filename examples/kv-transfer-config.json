@@ -8,6 +8,8 @@
     "local_cpu_gb": 16,
     "min_retrieve_tokens": 256,
     "min_hit_ratio": 0.1,
+    "min_saved_tokens": 8192,
+    "max_apc_prefix_to_hit_ratio": 8.0,
     "check_layers": [1],
     "recompute_ratios": [0.15],
     "async_prefetch": true,

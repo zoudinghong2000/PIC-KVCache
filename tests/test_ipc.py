@@ -11,8 +11,21 @@ def populate(store, source, tokens, rank):
     store.put_layer(segment_id, 0, torch.full((2, len(tokens), 1), rank))
 
 
+class RecordingStore(LocalPinnedCPUStore):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.match_calls = []
+
+    def match(self, model_scope, tokens, start_offset):
+        self.match_calls.append((len(tokens), start_offset))
+        return super().match(model_scope, tokens, start_offset)
+
+
 def test_tp_lookup_uses_exact_intersection_and_pins(tmp_path: Path):
-    stores = [LocalPinnedCPUStore(4, 4096, pin_memory=False) for _ in range(2)]
+    stores = [
+        RecordingStore(4, 4096, pin_memory=False),
+        LocalPinnedCPUStore(4, 4096, pin_memory=False),
+    ]
     for rank, store in enumerate(stores):
         populate(store, 0, [1, 2, 3, 4], rank)
     populate(stores[0], 4, [5, 6, 7, 8], 0)
@@ -24,13 +37,17 @@ def test_tp_lookup_uses_exact_intersection_and_pins(tmp_path: Path):
     ]
     for server in servers:
         server.start()
+    lookup = TensorParallelLookup(uris)
     try:
-        lookup = TensorParallelLookup(uris)
+        sockets = tuple(client._socket for client in lookup.clients)
         segments = lookup.lookup_and_prefetch("request", "m", [0, 1, 2, 3, 4, 5, 6, 7, 8], 1)
         assert [(value.target_start, value.source_start) for value in segments] == [(1, 0)]
+        assert stores[0].match_calls == [(8, 0)]
         for store in stores:
             assert store.get_layer("request", segments[0], 0) is not None
         lookup.cancel("request")
+        assert tuple(client._socket for client in lookup.clients) == sockets
     finally:
+        lookup.close()
         for server in servers:
             server.close()
