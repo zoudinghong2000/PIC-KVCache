@@ -10,7 +10,7 @@ from cacheblend_vllm.config import CacheBlendConfig
 from cacheblend_vllm.connector import CacheBlendConnectorV1, RequestMetadata
 from cacheblend_vllm.hashing import content_hash
 from cacheblend_vllm.trace import PipelineTracer
-from cacheblend_vllm.types import BlendPlan, SegmentId
+from cacheblend_vllm.types import BlendPlan, BlendSegment, SegmentId
 
 
 def make_connector():
@@ -177,3 +177,41 @@ def test_scheduler_lookup_is_submitted_and_polled_without_blocking(monkeypatch):
 
     connector._lookup_pool.shutdown(wait=True)
     connector._lookup_pool = None
+
+
+def test_sparse_q_lookup_includes_trailing_query_tokens():
+    connector = make_connector()
+    connector.config = CacheBlendConfig.from_extra_config(
+        {
+            "chunk_size": 4,
+            "selection_strategy": "sparse_q",
+            "check_layers": [1],
+            "min_retrieve_tokens": 0,
+            "strict_version_check": False,
+        }
+    )
+    connector.model_scope = "model"
+    connector._lookup_state_lock = threading.Lock()
+    connector._cancelled_lookup_ids = set()
+    connector._trace = PipelineTracer("test")
+
+    segment = BlendSegment(
+        SegmentId("model", content_hash((0, 1, 2, 3)), 0, 4),
+        target_start=0,
+    )
+
+    class Lookup:
+        @staticmethod
+        def lookup_and_prefetch(*_args):
+            return [segment]
+
+        @staticmethod
+        def cancel(_request_id):
+            raise AssertionError("accepted plan should not be cancelled")
+
+    connector._lookup = Lookup()
+    plan = connector._lookup_plan("sparse", list(range(12)), 0)
+
+    assert plan.allocation_end == 11
+    assert plan.hit_tokens == 4
+    assert plan.gap_tokens == 7

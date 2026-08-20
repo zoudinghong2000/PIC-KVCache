@@ -43,14 +43,19 @@ implementation; it is not a forward hook.
    prefix is disproportionately larger than the reuse. Rejected requests stay
    on vLLM's normal APC path.
 5. The scheduler reports the complete span through the standard external-token
-   count, so vLLM allocates and owns every destination block.
+   count, so vLLM allocates and owns every destination block. Sparse-Q and
+   compare modes extend this span through the trailing non-reuse question,
+   reserving only the final prompt token for regular vLLM execution.
 6. `start_load_kv` gathers the APC prefix, loads matched CPU segments, relocates
    cached RoPE keys from source to target positions with a direct delta
    rotation, and zeroes gaps. On Ascend, native paged-cache gather/scatter ops
    replace advanced indexing where their layout constraints are satisfied.
-7. The Qwen3 side executor runs the allocated suffix layer by layer. At a check
-   layer it compares fresh K with cached K, globally selects high-error hits
-   across TP ranks, and always retains gap tokens.
+7. The Qwen3 side executor runs the allocated suffix layer by layer. The
+   default selector compares fresh K with cached K. The optional Sparse-Q
+   selector keeps early layers dense, then uses non-reuse Queries to score the
+   complete causal Key context at one boundary layer. TP ranks aggregate token
+   scores before selecting Top-K hits; gaps, adjacent overflow blocks, and a
+   reused-tail fallback are always retained.
 8. Each completed layer is scattered into the vLLM-owned paged cache. The
    regular vLLM forward then computes the remaining prompt token and logits.
 9. Complete prompt chunks are saved layerwise on one default-priority Store
@@ -91,6 +96,11 @@ the only NPU stream roles owned by the data path.
 - APC pages are gathered as attention context but never overwritten by the
   side executor.
 - Every gap token is recomputed, regardless of the configured recompute ratio.
+- Sparse-Q score computation is chunked along Query rows, so its largest
+  temporary tensor is proportional to `query_score_chunk_size * context` rather
+  than every non-reuse Query at once.
+- Sparse-Q overflow uses vLLM's paged-KV block size, independently of the CPU
+  store's matching `chunk_size`.
 - LoRA, multimodal, and prompt-embedding requests bypass lookup and storage.
 - Only chunks that are known computed after the current scheduler step are
   stored; uncomputed capacity in the final block is never published.

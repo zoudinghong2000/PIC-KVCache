@@ -152,3 +152,116 @@ def test_selection_always_keeps_gaps_and_top_cached_scores():
         torch.tensor([True, False, True, False]),
     )
     assert selected.tolist() == [0, 1, 2]
+
+
+def test_sparse_q_scores_match_chunked_causal_attention():
+    executor = object.__new__(Qwen3BlendExecutor)
+    executor.tp_group = None
+    executor.block_size = 2
+    executor.config = CacheBlendConfig.from_extra_config(
+        {
+            "selection_strategy": "sparse_q",
+            "check_layers": [1],
+            "query_score_chunk_size": 1,
+            "overflow_blocks": 0,
+            "tail_query_tokens": 2,
+            "strict_version_check": False,
+        }
+    )
+    query_one_head = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[0.0, 1.0]],
+            [[1.0, 1.0]],
+            [[-1.0, 1.0]],
+        ]
+    )
+    query = torch.cat((query_one_head, query_one_head.flip(-1)), dim=1)
+    key = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[0.0, 1.0]],
+            [[1.0, 1.0]],
+            [[-1.0, 0.0]],
+            [[0.0, -1.0]],
+            [[-1.0, 1.0]],
+        ]
+    )
+    absolute = torch.tensor([2, 3, 4, 5])
+    gaps = torch.tensor([False, True, False, True])
+
+    scores, forced, stats = executor._sparse_q_scores(
+        query,
+        key,
+        absolute,
+        gaps,
+        scale=0.5,
+    )
+
+    sparse_query = query[gaps].permute(1, 0, 2)
+    sparse_positions = absolute[gaps]
+    logits = torch.matmul(sparse_query, key[:, 0].T) * 0.5
+    logits.masked_fill_(
+        sparse_positions[None, :, None] < torch.arange(key.shape[0])[None, None, :],
+        torch.finfo(logits.dtype).min,
+    )
+    expected = torch.softmax(logits, dim=-1).sum((0, 1))[absolute]
+    assert torch.allclose(scores, expected)
+    assert torch.equal(forced, gaps)
+    assert stats["sparse_query_tokens"] == 2
+    assert not stats["tail_fallback"]
+
+
+def test_sparse_q_forces_overflow_and_tail_fallback():
+    executor = object.__new__(Qwen3BlendExecutor)
+    executor.tp_group = None
+    executor.block_size = 2
+    executor.config = CacheBlendConfig.from_extra_config(
+        {
+            "chunk_size": 2,
+            "selection_strategy": "sparse_q",
+            "check_layers": [1],
+            "query_score_chunk_size": 2,
+            "overflow_blocks": 1,
+            "tail_query_tokens": 2,
+            "strict_version_check": False,
+        }
+    )
+    query = torch.ones(6, 1, 2)
+    key = torch.ones(6, 1, 2)
+    absolute = torch.arange(6)
+
+    _, forced, stats = executor._sparse_q_scores(
+        query,
+        key,
+        absolute,
+        torch.tensor([False, False, True, False, False, False]),
+        scale=1.0,
+    )
+    assert forced.tolist() == [True, True, True, True, True, False]
+    assert not stats["tail_fallback"]
+
+    _, forced, stats = executor._sparse_q_scores(
+        query,
+        key,
+        absolute,
+        torch.zeros(6, dtype=torch.bool),
+        scale=1.0,
+    )
+    assert forced.tolist() == [False, False, False, False, True, True]
+    assert stats["sparse_query_tokens"] == 2
+    assert stats["tail_fallback"]
+
+
+def test_forced_selection_does_not_consume_query_topk_budget():
+    executor = object.__new__(Qwen3BlendExecutor)
+    executor.tp_group = None
+    executor.config = CacheBlendConfig.from_extra_config(
+        {"recompute_ratios": [0.5], "strict_version_check": False}
+    )
+    selected = executor._select(
+        torch.tensor([0.0, 1.0, 10.0, 9.0]),
+        torch.tensor([True, False, False, False]),
+        forced_mask=torch.tensor([False, True, False, False]),
+    )
+    assert selected.tolist() == [0, 1, 2]

@@ -37,6 +37,7 @@ class RequestSpec:
     name: str
     prompt_token_ids: list[int]
     document_ids: tuple[int, ...]
+    expected_text: str | None = None
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
@@ -70,6 +71,12 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             "latency_mean_seconds": statistics.fmean(totals) if totals else None,
             "metrics_delta": dict(sorted(metrics.items())),
         }
+        quality = [record for record in successful if record.get("expected_text")]
+        if quality:
+            phases[phase]["quality_requests"] = len(quality)
+            phases[phase]["quality_accuracy"] = sum(
+                bool(record.get("correct")) for record in quality
+            ) / len(quality)
     gains: dict[str, float] = {}
     cold = phases.get("cold", {}).get("ttft_mean_seconds")
     blend = phases.get("blend", {}).get("ttft_mean_seconds")
@@ -90,11 +97,25 @@ def _tokenize(tokenizer: Any, text: str) -> list[int]:
     return list(tokenizer.encode(text, add_special_tokens=False))
 
 
-def build_document(tokenizer: Any, document_id: int, target_tokens: int) -> list[int]:
+def retrieval_code(document_id: int) -> str:
+    return f"ZXQ{document_id:06d}"
+
+
+def build_document(
+    tokenizer: Any,
+    document_id: int,
+    target_tokens: int,
+    include_retrieval_code: bool = False,
+) -> list[int]:
     """Build deterministic, position-varying text and trim it to an exact size."""
     if target_tokens <= 0:
         raise ValueError("document_tokens must be positive")
     sentences = [f"Document {document_id} contains reproducible benchmark facts. "]
+    if include_retrieval_code:
+        sentences.append(
+            f"The exact retrieval code for document {document_id} is "
+            f"{retrieval_code(document_id)}. "
+        )
     fact = 0
     token_ids: list[int] = []
     while len(token_ids) < target_tokens:
@@ -258,6 +279,11 @@ def run_request(args: argparse.Namespace, spec: RequestSpec) -> dict[str, Any]:
             "client_started_ns": started_ns,
             **result,
         }
+        if spec.expected_text is not None:
+            record["expected_text"] = spec.expected_text
+            record["correct"] = spec.expected_text.casefold() in result[
+                "output_text"
+            ].casefold()
     except Exception as error:  # noqa: BLE001 - record each failed request and continue
         record = {
             "phase": spec.phase,
@@ -277,9 +303,13 @@ def create_workload(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Requ
     prefix = bos + _tokenize(tokenizer, "You are a precise document analysis assistant.")
     separator = _tokenize(tokenizer, "\n\n--- CACHEBLEND DOCUMENT BOUNDARY ---\n\n")
     populate_question = _tokenize(tokenizer, "\nAcknowledge this document with one token.")
-    blend_question = _tokenize(tokenizer, "\nCompare the supplied documents with one token.")
     documents = {
-        index: build_document(tokenizer, index, args.document_tokens)
+        index: build_document(
+            tokenizer,
+            index,
+            args.document_tokens,
+            include_retrieval_code=args.quality,
+        )
         for index in range(args.num_documents)
     }
     orders = build_orders(
@@ -305,15 +335,31 @@ def create_workload(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Requ
                 (document_id,),
             )
         )
-    blend_specs = [
-        RequestSpec(
-            "blend",
-            f"blend-{index}",
-            build_prompt(prefix, separator, documents, order, blend_question),
-            order,
+    blend_specs = []
+    for index, order in enumerate(orders):
+        target = order[-1]
+        expected = retrieval_code(target) if args.quality else None
+        question = (
+            f"\nWhat is the exact retrieval code for document {target}? "
+            "Return only that code."
+            if args.quality
+            else "\nCompare the supplied documents with one token."
         )
-        for index, order in enumerate(orders)
-    ]
+        blend_specs.append(
+            RequestSpec(
+                "blend",
+                f"blend-{index}",
+                build_prompt(
+                    prefix,
+                    separator,
+                    documents,
+                    order,
+                    _tokenize(tokenizer, question),
+                ),
+                order,
+                expected,
+            )
+        )
     specs.extend(blend_specs)
     for index in range(args.apc_repeats):
         source = blend_specs[index % len(blend_specs)]
@@ -323,6 +369,7 @@ def create_workload(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Requ
                 f"apc-repeat-{index}",
                 source.prompt_token_ids,
                 source.document_ids,
+                source.expected_text,
             )
         )
 
@@ -333,16 +380,32 @@ def create_workload(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Requ
             tokenizer,
             document_id,
             args.document_tokens,
+            include_retrieval_code=args.quality,
         )
     for request_index in range(args.cold_requests):
         begin = request_index * args.documents_per_query + args.num_documents
         order = tuple(range(begin, begin + args.documents_per_query))
+        target = order[-1]
+        expected = retrieval_code(target) if args.quality else None
+        question = (
+            f"\nWhat is the exact retrieval code for document {target}? "
+            "Return only that code."
+            if args.quality
+            else "\nCompare the supplied documents with one token."
+        )
         specs.append(
             RequestSpec(
                 "cold",
                 f"cold-{request_index}",
-                build_prompt(prefix, separator, cold_documents, order, blend_question),
+                build_prompt(
+                    prefix,
+                    separator,
+                    cold_documents,
+                    order,
+                    _tokenize(tokenizer, question),
+                ),
                 order,
+                expected,
             )
         )
 
@@ -351,6 +414,7 @@ def create_workload(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Requ
         "document_tokens": args.document_tokens,
         "num_documents": args.num_documents,
         "documents_per_query": args.documents_per_query,
+        "quality": args.quality,
         "blend_orders": [list(order) for order in orders],
         "documents": {
             str(index): {"tokens": len(tokens), "digest": token_digest(tokens)}
@@ -394,6 +458,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--apc-repeats", type=int, default=2)
     parser.add_argument("--cold-requests", type=int, default=2)
     parser.add_argument("--output-tokens", type=int, default=1)
+    parser.add_argument(
+        "--quality",
+        action="store_true",
+        help="Ask deterministic needle questions and report exact-code accuracy",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--settle-seconds", type=float, default=0.50)
     parser.add_argument("--timeout", type=float, default=1800)

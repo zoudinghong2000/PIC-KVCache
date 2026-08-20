@@ -62,6 +62,13 @@ include:
 | `MAX_APC_PREFIX_TO_HIT_RATIO` | `8.0` | Benchmark-only APC/hit gate |
 | `STORE_WORKERS` | `1` | Host publication worker count |
 | `MAX_INFLIGHT_STORE_BATCHES` | `8` | Store queue backpressure limit |
+| `SELECTION_STRATEGY` | `kv_deviation` | `kv_deviation`, `sparse_q`, or diagnostic `compare` |
+| `CHECK_LAYER` | `1` or `6` | Boundary layer; Sparse-Q defaults to 6 |
+| `RECOMPUTE_RATIO` | `0.15` | Cached-token Top-K budget after the boundary |
+| `QUERY_SCORE_CHUNK_SIZE` | `8` | Sparse Query rows scored per NPU chunk |
+| `OVERFLOW_BLOCKS` | `1` | vLLM blocks retained around non-reuse spans |
+| `TAIL_QUERY_TOKENS` | `64` | Fallback Query/retention tail when no natural gap exists |
+| `QUALITY` | `0` | Ask deterministic retrieval-code questions and score accuracy |
 | `NUM_DOCUMENTS` | `4` | Warm document corpus size |
 | `DOCUMENT_TOKENS` | `4096` | Exact tokens per generated document |
 | `DOCUMENTS_PER_QUERY` | `4` | Documents in each blend/cold prompt |
@@ -86,6 +93,21 @@ RUN_DIR=/tmp/cacheblend-clean \
 MODEL=/path/to/model \
 bash benchmarks/cacheblend/run_arm.sh
 ```
+
+Run full recompute, K-deviation, Sparse-Q, and the diagnostic comparison with
+the same deterministic quality workload:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=2,3 \
+MODEL=/path/to/qwen3-30b-a3b \
+bash benchmarks/cacheblend/run_query_aware_suite.sh
+```
+
+The generated report puts blend TTFT and exact-code accuracy side by side. The
+`compare` arm also records the two selectors' token-set overlap and Jaccard in
+the pipeline trace. Sparse-Q deliberately expands the allocated blend span to
+include the trailing non-reuse question (except the final prompt token), so its
+Queries are semantic question tokens rather than only document separators.
 
 ## Trace the data pipeline
 

@@ -49,6 +49,10 @@ vllm serve MODEL \
       "max_apc_prefix_to_hit_ratio":0.0,
       "check_layers":[1],
       "recompute_ratios":[0.15],
+      "selection_strategy":"kv_deviation",
+      "query_score_chunk_size":8,
+      "overflow_blocks":1,
+      "tail_query_tokens":64,
       "tp_global_selection":true,
       "event_pipeline":true,
       "fused_segment_copy":true,
@@ -83,6 +87,10 @@ completed suffix into vLLM-owned pages before the regular one-token forward.
 | `max_apc_prefix_to_hit_ratio` | `0.0` | Skip when gathering the APC prefix dominates hits; `0` disables |
 | `check_layers` | `[1]` | Layers that score cached K error |
 | `recompute_ratios` | `[0.15]` | Cached-token fraction retained at each check layer |
+| `selection_strategy` | `kv_deviation` | `kv_deviation`, SparseX-style `sparse_q`, or diagnostic `compare` |
+| `query_score_chunk_size` | `8` | Sparse-Q query rows per score chunk; bounds NPU temporary memory |
+| `overflow_blocks` | `1` | Cache blocks retained on both sides of non-reuse intervals |
+| `tail_query_tokens` | `64` | Reused tail tokens used when a request has no natural Sparse-Q |
 | `save_decode_cache` | `false` | Store decode KV as well as complete prompt chunks |
 | `lookup_timeout_ms` | `10000` | Per-rank local lookup RPC timeout |
 | `store_workers` | `1` | Host publication workers behind the ordered Store stream |
@@ -96,6 +104,18 @@ pipeline parallelism because its layerwise executor currently assumes all
 decoder layers are local. Profitability gates are intentionally neutral in the
 library; the benchmark profile sets `min_saved_tokens=8192` and
 `max_apc_prefix_to_hit_ratio=8.0` for its Qwen3-30B workload.
+
+### Query-aware selection
+
+`sparse_q` uses non-reused prompt tokens as Queries to score the full causal
+Key context at one boundary layer. For Qwen3-30B-A3B's 48 layers, start by
+testing layers 5, 6, and 7. The boundary layer remains dense; Top-K cached
+tokens, all gaps, adjacent overflow blocks, and the tail fallback continue
+through later layers. Its scheduler span includes the trailing question while
+still reserving the final prompt token for vLLM. `compare` computes both
+Sparse-Q and K-deviation sets, emits their overlap to the pipeline trace, and
+follows K-deviation at the same boundary, so the diagnostic scorer itself does
+not alter selection.
 
 ## Validate
 
@@ -132,6 +152,15 @@ bash benchmarks/cacheblend/run_suite.sh
 It records per-phase TTFT/metrics and can emit an opt-in scheduler/worker
 pipeline trace. See [the benchmark guide](benchmarks/cacheblend/README.md) and
 [the Chinese pipeline walkthrough](docs/BENCHMARK_WALKTHROUGH.md).
+
+The Query-aware suite additionally asks deterministic retrieval-code questions
+and reports exact-answer accuracy alongside TTFT:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=2,3 \
+MODEL=/path/to/qwen3-30b-a3b \
+bash benchmarks/cacheblend/run_query_aware_suite.sh
+```
 
 ## Historical validated result
 

@@ -22,6 +22,23 @@ MAX_APC_PREFIX_TO_HIT_RATIO="${MAX_APC_PREFIX_TO_HIT_RATIO:-8.0}"
 LOOKUP_TIMEOUT_MS="${LOOKUP_TIMEOUT_MS:-10000}"
 STORE_WORKERS="${STORE_WORKERS:-1}"
 MAX_INFLIGHT_STORE_BATCHES="${MAX_INFLIGHT_STORE_BATCHES:-8}"
+SELECTION_STRATEGY="${SELECTION_STRATEGY:-kv_deviation}"
+CHECK_LAYER="${CHECK_LAYER:-}"
+RECOMPUTE_RATIO="${RECOMPUTE_RATIO:-0.15}"
+QUERY_SCORE_CHUNK_SIZE="${QUERY_SCORE_CHUNK_SIZE:-8}"
+OVERFLOW_BLOCKS="${OVERFLOW_BLOCKS:-1}"
+TAIL_QUERY_TOKENS="${TAIL_QUERY_TOKENS:-64}"
+QUALITY="${QUALITY:-0}"
+if [[ -z "$CHECK_LAYER" ]]; then
+  if [[ "$SELECTION_STRATEGY" == kv_deviation ]]; then
+    CHECK_LAYER=1
+  else
+    CHECK_LAYER=6
+  fi
+fi
+if [[ -z "${OUTPUT_TOKENS:-}" ]]; then
+  OUTPUT_TOKENS=$([[ "$QUALITY" == 1 ]] && echo 8 || echo 1)
+fi
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-1200}"
 REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-1800}"
@@ -100,7 +117,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":${MIN_SAVED_TOKENS},\"max_apc_prefix_to_hit_ratio\":${MAX_APC_PREFIX_TO_HIT_RATIO},\"check_layers\":[1],\"recompute_ratios\":[0.15],\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true,\"lookup_timeout_ms\":${LOOKUP_TIMEOUT_MS},\"store_workers\":${STORE_WORKERS},\"max_inflight_store_batches\":${MAX_INFLIGHT_STORE_BATCHES}}}"
+KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":${MIN_SAVED_TOKENS},\"max_apc_prefix_to_hit_ratio\":${MAX_APC_PREFIX_TO_HIT_RATIO},\"check_layers\":[${CHECK_LAYER}],\"recompute_ratios\":[${RECOMPUTE_RATIO}],\"selection_strategy\":\"${SELECTION_STRATEGY}\",\"query_score_chunk_size\":${QUERY_SCORE_CHUNK_SIZE},\"overflow_blocks\":${OVERFLOW_BLOCKS},\"tail_query_tokens\":${TAIL_QUERY_TOKENS},\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true,\"lookup_timeout_ms\":${LOOKUP_TIMEOUT_MS},\"store_workers\":${STORE_WORKERS},\"max_inflight_store_batches\":${MAX_INFLIGHT_STORE_BATCHES}}}"
 
 VLLM_ARGS=(
   serve "$MODEL"
@@ -149,6 +166,11 @@ done
 curl --noproxy '*' -fsS --max-time 2 "http://127.0.0.1:${VLLM_PORT}/health" >/dev/null
 echo "server healthy"
 
+QUALITY_ARGS=()
+if [[ "$QUALITY" == 1 ]]; then
+  QUALITY_ARGS+=(--quality)
+fi
+
 python -m benchmarks.cacheblend.benchmark \
   --api-base "http://127.0.0.1:${VLLM_PORT}/v1" \
   --metrics-url "http://127.0.0.1:${VLLM_PORT}/metrics" \
@@ -161,10 +183,11 @@ python -m benchmarks.cacheblend.benchmark \
   --blend-requests "${BLEND_REQUESTS:-4}" \
   --apc-repeats "${APC_REPEATS:-2}" \
   --cold-requests "${COLD_REQUESTS:-2}" \
-  --output-tokens "${OUTPUT_TOKENS:-1}" \
+  --output-tokens "$OUTPUT_TOKENS" \
   --seed "${BENCHMARK_SEED:-0}" \
   --settle-seconds "${SETTLE_SECONDS:-0.50}" \
-  --timeout "$REQUEST_TIMEOUT_SECONDS" 2>&1 | tee "$CLIENT_LOG"
+  --timeout "$REQUEST_TIMEOUT_SECONDS" \
+  "${QUALITY_ARGS[@]}" 2>&1 | tee "$CLIENT_LOG"
 
 python -m benchmarks.cacheblend.analyze \
   --run "$BENCH_ARM=$RUN_DIR" \

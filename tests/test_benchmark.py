@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from benchmarks.cacheblend.analyze import measured_trace_rows, summarize_trace, write_timeline
+from benchmarks.cacheblend.analyze import (
+    measured_trace_rows,
+    sparse_selection_rows,
+    summarize_trace,
+    write_timeline,
+)
 from benchmarks.cacheblend.benchmark import (
     build_document,
     build_orders,
@@ -28,6 +33,17 @@ def test_document_has_exact_deterministic_token_length():
     assert first == second
     assert token_digest(first) == token_digest(second)
     assert token_digest(first) != token_digest(other)
+
+    quality = build_document(
+        tokenizer,
+        document_id=3,
+        target_tokens=1025,
+        include_retrieval_code=True,
+    )
+    assert [ord(character) for character in "ZXQ000003"] in [
+        quality[index : index + len("ZXQ000003")]
+        for index in range(len(quality) - len("ZXQ000003") + 1)
+    ]
 
 
 def test_blend_orders_are_reproducible_and_non_contiguous():
@@ -56,6 +72,8 @@ def test_summary_groups_phases_and_computes_gain():
             "ttft_seconds": 2.0,
             "total_seconds": 2.1,
             "metrics_delta": {"external": 80},
+            "expected_text": "ZXQ000001",
+            "correct": True,
         },
         {
             "phase": "blend",
@@ -63,6 +81,8 @@ def test_summary_groups_phases_and_computes_gain():
             "ttft_seconds": 4.0,
             "total_seconds": 4.1,
             "metrics_delta": {"external": 70},
+            "expected_text": "ZXQ000002",
+            "correct": False,
         },
         {
             "phase": "cold",
@@ -78,6 +98,7 @@ def test_summary_groups_phases_and_computes_gain():
     assert summary["errors"] == 0
     assert summary["phases"]["blend"]["ttft_mean_seconds"] == 3.0
     assert summary["phases"]["blend"]["metrics_delta"]["external"] == 150
+    assert summary["phases"]["blend"]["quality_accuracy"] == 0.5
     assert summary["gains"]["cold_over_blend"] == 3.0
     assert percentile([4.0, 1.0, 2.0, 3.0], 0.90) == 4.0
 
@@ -141,3 +162,24 @@ def test_trace_join_accepts_vllm_internal_request_suffix():
 
     assert measured[0]["benchmark_phase"] == "blend"
     assert measured[0]["benchmark_name"] == "blend-0"
+
+
+def test_sparse_selection_report_preserves_pipeline_counts():
+    rows = [
+        {
+            "event": "selection_finished",
+            "benchmark_phase": "blend",
+            "benchmark_name": "blend-0",
+            "layer_id": 6,
+            "active_tokens": 1024,
+            "cached_tokens": 900,
+            "gap_tokens": 124,
+            "sparse_query_tokens": 124,
+            "selected_tokens": 387,
+            "tail_fallback": False,
+        }
+    ]
+
+    assert sparse_selection_rows(rows) == [
+        ["blend", "blend-0", "6", "1024", "900", "124", "124", "387", "False"]
+    ]

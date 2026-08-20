@@ -408,12 +408,20 @@ class PagedBlendLoader:
 
 
 class Qwen3BlendExecutor:
-    def __init__(self, model, config: CacheBlendConfig):
+    def __init__(self, model, config: CacheBlendConfig, block_size: int):
         self.model = model
         self.config = config
+        if block_size <= 0:
+            raise ValueError("vLLM KV cache block_size must be positive")
+        self.block_size = block_size
         self.layers = list(model.model.layers[model.model.start_layer : model.model.end_layer])
         if not self.layers:
             raise RuntimeError("Qwen3 model has no local decoder layers")
+        if max(config.check_layers) >= len(self.layers):
+            raise ValueError(
+                "CacheBlend check layer exceeds the local Qwen3 layer range: "
+                f"check_layers={config.check_layers}, layers={len(self.layers)}"
+            )
         validate_rope_support(model, self.layers[0].self_attn.rotary_emb)
         try:
             from vllm.distributed.parallel_state import get_tp_group
@@ -457,7 +465,14 @@ class Qwen3BlendExecutor:
             if layer_id + 1 < len(self.layers):
                 loader.prefetch(layer_id + 1, self.layers[layer_id + 1].self_attn.rotary_emb)
             hidden_states, residual, state, old_kv = self._compute_layer(
-                layer_id, layer, hidden_states, residual, state, old_kv
+                layer_id,
+                layer,
+                hidden_states,
+                residual,
+                state,
+                old_kv,
+                request_id=request_id,
+                tracer=loader.tracer,
             )
             if loader.tracer is not None and loader.tracer.enabled:
                 loader.tracer.emit(
@@ -485,6 +500,8 @@ class Qwen3BlendExecutor:
         residual: torch.Tensor | None,
         state: BlendExecutionState,
         old_kv: torch.Tensor,
+        request_id: str | None = None,
+        tracer: PipelineTracer | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, BlendExecutionState, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -507,16 +524,64 @@ class Qwen3BlendExecutor:
 
         flat_old_k = old_kv[0].reshape(old_kv.shape[1], -1)
         flat_old_v = old_kv[1].reshape(old_kv.shape[1], -1)
-        if layer_id in self.config.check_layers:
-            scores = torch.sum(
+        check_layer = layer_id in self.config.check_layers
+        strategy = self.config.selection_strategy
+        active_gap_mask = state.gap_mask[absolute_indices]
+        deviation_selected: torch.Tensor | None = None
+        sparse_q_selected: torch.Tensor | None = None
+        sparse_q_stats: dict[str, int | bool] = {}
+
+        if check_layer and strategy in {"kv_deviation", "compare"}:
+            deviation_scores = torch.sum(
                 (k.float() - flat_old_k[absolute_indices].float()) ** 2,
                 dim=-1,
             )
-            selected = self._select(
-                scores,
-                state.gap_mask[absolute_indices],
+            deviation_selected = self._select(
+                deviation_scores,
+                active_gap_mask,
                 layer_id,
             )
+
+        if check_layer and strategy in {"sparse_q", "compare"}:
+            attn = layer.self_attn.attn
+            num_heads = int(attn.num_heads)
+            num_kv_heads = int(attn.num_kv_heads)
+            head_size = int(attn.head_size)
+            # The boundary score must see the fresh Keys produced by dense
+            # contextualization, while APC Keys remain in their native pages.
+            score_keys = flat_old_k if strategy == "sparse_q" else flat_old_k.clone()
+            score_keys[absolute_indices] = k
+            query_scores, forced_mask, sparse_q_stats = self._sparse_q_scores(
+                q.view(-1, num_heads, head_size),
+                score_keys.view(-1, num_kv_heads, head_size),
+                absolute_indices,
+                active_gap_mask,
+                float(attn.impl.scale),
+            )
+            sparse_q_selected = self._select(
+                query_scores,
+                active_gap_mask,
+                layer_id,
+                forced_mask=forced_mask,
+            )
+
+        if check_layer and strategy == "compare":
+            assert deviation_selected is not None and sparse_q_selected is not None
+            self._trace_selection_comparison(
+                tracer,
+                request_id,
+                layer_id,
+                deviation_selected,
+                sparse_q_selected,
+                sparse_q_stats,
+            )
+
+        # K-deviation preserves the original CacheBlend behavior: prune before
+        # the check-layer attention. Compare mode observes Sparse-Q but follows
+        # this same path so it cannot change model output.
+        if check_layer and strategy in {"kv_deviation", "compare"}:
+            assert deviation_selected is not None
+            selected = deviation_selected
             q, k, v = q[selected], k[selected], v[selected]
             residual = residual[selected]
             query_indices = query_indices[selected]
@@ -548,7 +613,138 @@ class Qwen3BlendExecutor:
         hidden_states, _ = layer.self_attn.o_proj(attn_output)
         hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
         hidden_states = layer.mlp(hidden_states)
+
+        # SparseX uses the boundary layer itself for dense contextualization,
+        # then applies the Query-aware set to every later layer.
+        if check_layer and strategy == "sparse_q":
+            assert sparse_q_selected is not None
+            hidden_states = hidden_states[sparse_q_selected]
+            residual = residual[sparse_q_selected]
+            query_indices = query_indices[sparse_q_selected]
+            state.important_indices = query_indices
+            state.positions = state.positions[sparse_q_selected]
+            state.attention_mask = None
+            if tracer is not None and tracer.enabled:
+                tracer.emit(
+                    "selection_finished",
+                    request_id=request_id,
+                    layer_id=layer_id,
+                    strategy="sparse_q",
+                    selected_tokens=sparse_q_selected.numel(),
+                    **sparse_q_stats,
+                )
         return hidden_states, residual, state, old_kv
+
+    def _sparse_q_scores(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        absolute_indices: torch.Tensor,
+        gap_mask: torch.Tensor,
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | bool]]:
+        """Aggregate causal Sparse-Q attention into one score per active token.
+
+        Query chunks bound the temporary ``[KV heads, groups, Q, context]``
+        probability tensor. The result remains local to this TP rank; `_select`
+        performs the existing all-reduce before global Top-K selection.
+        """
+        query_mask = gap_mask.clone()
+        forced_mask = gap_mask.clone()
+        gap_count = torch.where(gap_mask)[0].numel()
+        has_gap = bool(query_mask.any().item())
+        tail_fallback = not has_gap
+        if tail_fallback:
+            tail = min(self.config.tail_query_tokens, query.shape[0])
+            query_mask[-tail:] = True
+            forced_mask[-tail:] = True
+
+        radius = self.config.overflow_blocks * self.block_size
+        if radius and has_gap:
+            # A prefix-sum window expands each non-reuse interval by the
+            # configured number of cache blocks without a host-side index loop.
+            values = gap_mask.to(torch.int32)
+            prefix = torch.cat((values.new_zeros(1), values.cumsum(0)))
+            positions = torch.arange(values.numel(), device=values.device)
+            left = (positions - radius).clamp_min(0)
+            right = (positions + radius + 1).clamp_max(values.numel())
+            forced_mask |= prefix[right] > prefix[left]
+
+        sparse_indices = torch.where(query_mask)[0]
+        sparse_query = query.index_select(0, sparse_indices)
+        sparse_positions = absolute_indices.index_select(0, sparse_indices)
+        num_heads = query.shape[1]
+        num_kv_heads = key.shape[1]
+        if num_heads % num_kv_heads:
+            raise ValueError(
+                "Sparse-Q requires query heads to be divisible by KV heads; "
+                f"got {num_heads} and {num_kv_heads}"
+            )
+        groups = num_heads // num_kv_heads
+        key_transposed = key.permute(1, 2, 0).contiguous()
+        key_positions = torch.arange(key.shape[0], device=query.device)
+        full_scores = torch.zeros(key.shape[0], dtype=torch.float32, device=query.device)
+        chunk_size = self.config.query_score_chunk_size
+
+        for start in range(0, sparse_query.shape[0], chunk_size):
+            end = min(start + chunk_size, sparse_query.shape[0])
+            query_chunk = sparse_query[start:end]
+            query_chunk = query_chunk.view(end - start, num_kv_heads, groups, -1)
+            query_chunk = query_chunk.permute(1, 2, 0, 3).contiguous()
+            logits = torch.matmul(query_chunk, key_transposed[:, None]).float()
+            logits.mul_(scale)
+            causal_mask = sparse_positions[start:end, None] < key_positions[None, :]
+            logits.masked_fill_(causal_mask[None, None], torch.finfo(logits.dtype).min)
+            full_scores.add_(torch.softmax(logits, dim=-1).sum(dim=(0, 1, 2)))
+
+        return (
+            full_scores.index_select(0, absolute_indices),
+            forced_mask,
+            {
+                "active_tokens": query.shape[0],
+                "gap_tokens": gap_count,
+                "cached_tokens": query.shape[0] - gap_count,
+                "sparse_query_tokens": sparse_indices.numel(),
+                "tail_fallback": tail_fallback,
+                "overflow_blocks": self.config.overflow_blocks,
+            },
+        )
+
+    @staticmethod
+    def _trace_selection_comparison(
+        tracer: PipelineTracer | None,
+        request_id: str | None,
+        layer_id: int,
+        deviation_selected: torch.Tensor,
+        sparse_q_selected: torch.Tensor,
+        sparse_q_stats: dict[str, int | bool],
+    ) -> None:
+        if tracer is None or not tracer.enabled:
+            return
+        size = max(
+            int(deviation_selected.max().item()) if deviation_selected.numel() else -1,
+            int(sparse_q_selected.max().item()) if sparse_q_selected.numel() else -1,
+        ) + 1
+        deviation_mask = torch.zeros(
+            size,
+            dtype=torch.bool,
+            device=deviation_selected.device,
+        )
+        sparse_q_mask = torch.zeros_like(deviation_mask)
+        deviation_mask[deviation_selected] = True
+        sparse_q_mask[sparse_q_selected] = True
+        overlap = int((deviation_mask & sparse_q_mask).sum().item())
+        union = int((deviation_mask | sparse_q_mask).sum().item())
+        tracer.emit(
+            "selection_compared",
+            request_id=request_id,
+            layer_id=layer_id,
+            deviation_tokens=deviation_selected.numel(),
+            sparse_q_tokens=sparse_q_selected.numel(),
+            overlap_tokens=overlap,
+            jaccard=overlap / max(union, 1),
+            **sparse_q_stats,
+        )
 
     @staticmethod
     def _qk_post_process(attn_layer, positions, q, k):
@@ -563,6 +759,7 @@ class Qwen3BlendExecutor:
         scores: torch.Tensor,
         gap_mask: torch.Tensor,
         layer_id: int | None = None,
+        forced_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         tp_group = self.tp_group
         use_tp = (
@@ -570,21 +767,28 @@ class Qwen3BlendExecutor:
         )
         if use_tp:
             scores = tp_group.all_reduce(scores)
-        gap_positions = torch.where(gap_mask)[0]
-        cached_count = scores.numel() - gap_positions.numel()
+        base_mask = gap_mask.clone()
+        if forced_mask is not None:
+            if forced_mask.shape != gap_mask.shape:
+                raise ValueError("forced selection mask must match the active token shape")
+            base_mask |= forced_mask
+        cached_count = scores.numel() - torch.where(gap_mask)[0].numel()
         check_index = (
             self.config.check_layers.index(layer_id) if layer_id in self.config.check_layers else 0
         )
         ratio_index = min(len(self.config.recompute_ratios) - 1, check_index)
         topk = int(cached_count * self.config.recompute_ratios[ratio_index])
-        if cached_count:
-            topk = min(max(topk, 1), cached_count)
-        selected_count = gap_positions.numel() + topk
+        available_count = scores.numel() - torch.where(base_mask)[0].numel()
+        if cached_count and available_count:
+            topk = min(max(topk, 1), available_count)
+        else:
+            topk = 0
+        selected_count = scores.numel() - available_count + topk
         choose_here = not use_tp or tp_group.rank_in_group == 0
         if choose_here:
-            selected_mask = gap_mask.clone()
+            selected_mask = base_mask
             if topk:
-                cached_scores = scores.masked_fill(gap_mask, float("-inf"))
+                cached_scores = scores.masked_fill(base_mask, float("-inf"))
                 selected_mask[torch.topk(cached_scores, k=topk).indices] = True
             selected = torch.where(selected_mask)[0]
         else:

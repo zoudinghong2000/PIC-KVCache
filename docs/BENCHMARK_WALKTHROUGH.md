@@ -102,8 +102,10 @@ worker 在 `start_load_kv()` 创建 `PagedBlendLoader`，随后
 3. 把多个命中 segment 融合复制到 staging；
 4. 对 K 应用 `R(new) * R(old)^-1`，把原始文档位置迁移到新 prompt 位置；
 5. gap token 每层都重算；
-6. 在 `check_layers` 比较当前 K 与缓存 K，按 `recompute_ratios` 选出误差较大的
-   命中 token，从后续层继续重算；
+6. 默认 `kv_deviation` 在 `check_layers` 比较当前 K 与缓存 K，按
+   `recompute_ratios` 选出误差较大的命中 token；`sparse_q` 则让 trailing
+   question 和其他 gap Query 在一个较后的 boundary layer 对完整 causal Key
+   context 打分，再保留 Top-K 命中、全部 gap、overflow block 和 tail fallback；
 7. 将完整 suffix scatter 到 vLLM 已分配的 paged KV cache；
 8. load stream 与 compute stream 用 event 建依赖，不做全设备同步。
 
@@ -136,6 +138,8 @@ KV。与之前 Gather + Offload 双 stream 不同，保存完成现在是明确�
 | `layer_prefetch_enqueued` | worker，`prefetch()` | CPU->NPU、位置迁移和相关操作的 host enqueue 开销 |
 | `layer_prefetch_wait_enqueued` | worker，`get()` | compute stream 是否建立了预取依赖 |
 | `layer_compute_enqueued` | worker，executor loop | 每层实际选择了多少 token 进入重算 |
+| `selection_finished` | worker，Sparse-Q boundary | Sparse Query、overflow 与最终选择规模是否符合预期 |
+| `selection_compared` | worker，`compare` 模式 | Sparse-Q 与 K-deviation 的 overlap/Jaccard 有多大 |
 | `layer_committed` | worker，`commit()` | 哪些层已经把 suffix scatter 回 vLLM pages |
 | `save_store_enqueued` | worker，`save_kv_layer()` | 单 Store stream 上 gather + D2H 的 host enqueue 开销 |
 | `save_store_finished` | worker，保存线程 | 每层 Store event 完成并发布 host view 的时间 |
@@ -160,8 +164,10 @@ name、TTFT 和相对客户端起点的时间，并排除 warmup 事件。TP wor
    文档分隔方式或 profitability gate，通常比微调 kernel 更值。
 4. **看 H2D 是否隐藏**：检查第 N+1 层 prefetch 是否与第 N 层 compute 重叠。
    若 compute 经常等 load，再考虑更大的融合传输或 native transfer kernel。
-5. **调选择性重算**：改变 `check_layers`、`recompute_ratios`，同时观察 TTFT 和
-   任务质量；比例越低不一定越好，错误 KV 会传到后续层。
+5. **调选择性重算**：先用 `compare` 在同一请求上记录 Sparse-Q 与 K-deviation
+   的 overlap/Jaccard，再分别运行两种 selector；改变 `check_layers`、
+   `recompute_ratios` 时必须同时观察 TTFT 和 retrieval-code accuracy。比例越低
+   不一定越好，错误 KV 会传到后续层。
 6. **看保存反压**：`save_store_wait_finished` 直接进入未命中请求延迟。若它很大，
    检查单 Store stream 上 gather/D2H 的带宽、staging 数量和 serving 竞争；此时
    不再需要用 sleep 猜测 cache 是否 ready。

@@ -39,6 +39,7 @@ def build_arm_table(runs: list[tuple[str, Path]]) -> tuple[list[str], list[list[
         "Arm",
         "Populate mean",
         "Blend mean",
+        "Blend accuracy",
         "APC repeat",
         "Cold mean",
         "Cold/Blend",
@@ -54,6 +55,7 @@ def build_arm_table(runs: list[tuple[str, Path]]) -> tuple[list[str], list[list[
                 name,
                 format_number(phase_value(summary, "populate", "ttft_mean_seconds")),
                 format_number(phase_value(summary, "blend", "ttft_mean_seconds")),
+                format_number(phase_value(summary, "blend", "quality_accuracy"), 2),
                 format_number(phase_value(summary, "apc_repeat", "ttft_mean_seconds")),
                 format_number(phase_value(summary, "cold", "ttft_mean_seconds")),
                 format_number(summary.get("gains", {}).get("cold_over_blend"), 2),
@@ -215,6 +217,48 @@ def lookup_rows(rows: list[dict[str, Any]]) -> list[list[str]]:
     return result
 
 
+def selection_rows(rows: list[dict[str, Any]]) -> list[list[str]]:
+    result = []
+    for row in rows:
+        if row["event"] != "selection_compared":
+            continue
+        result.append(
+            [
+                str(row["benchmark_phase"]),
+                str(row["benchmark_name"]),
+                str(row.get("layer_id", "-")),
+                str(row.get("deviation_tokens", 0)),
+                str(row.get("sparse_q_tokens", 0)),
+                str(row.get("overlap_tokens", 0)),
+                format_number(row.get("jaccard"), 3),
+                str(row.get("sparse_query_tokens", 0)),
+                str(bool(row.get("tail_fallback", False))),
+            ]
+        )
+    return result
+
+
+def sparse_selection_rows(rows: list[dict[str, Any]]) -> list[list[str]]:
+    result = []
+    for row in rows:
+        if row["event"] != "selection_finished":
+            continue
+        result.append(
+            [
+                str(row["benchmark_phase"]),
+                str(row["benchmark_name"]),
+                str(row.get("layer_id", "-")),
+                str(row.get("active_tokens", 0)),
+                str(row.get("cached_tokens", 0)),
+                str(row.get("gap_tokens", 0)),
+                str(row.get("sparse_query_tokens", 0)),
+                str(row.get("selected_tokens", 0)),
+                str(bool(row.get("tail_fallback", False))),
+            ]
+        )
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="append", type=parse_run, required=True)
@@ -239,6 +283,8 @@ def main() -> None:
         if not trace_rows:
             continue
         stages = summarize_trace(trace_rows)
+        comparisons = selection_rows(trace_rows)
+        sparse_selections = sparse_selection_rows(trace_rows)
         trace_payload[name] = stages
         write_timeline(path, trace_rows)
         report.extend(
@@ -267,6 +313,54 @@ def main() -> None:
                     ],
                     lookup_rows(trace_rows),
                 ),
+            ]
+        )
+        if comparisons:
+            report.extend(
+                [
+                    "",
+                    "### Query-aware selection comparison",
+                    "",
+                    markdown_table(
+                        [
+                            "Phase",
+                            "Request",
+                            "Layer",
+                            "K deviation",
+                            "Sparse-Q",
+                            "Overlap",
+                            "Jaccard",
+                            "Sparse queries",
+                            "Tail fallback",
+                        ],
+                        comparisons,
+                    ),
+                ]
+            )
+        if sparse_selections:
+            report.extend(
+                [
+                    "",
+                    "### Sparse-Q selections",
+                    "",
+                    markdown_table(
+                        [
+                            "Phase",
+                            "Request",
+                            "Layer",
+                            "Active",
+                            "Cached",
+                            "Gaps",
+                            "Sparse queries",
+                            "Selected",
+                            "Tail fallback",
+                        ],
+                        sparse_selections,
+                    ),
+                ]
+            )
+        report.extend(
+            [
                 "",
                 "### Stage events",
                 "",

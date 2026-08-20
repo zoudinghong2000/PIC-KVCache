@@ -198,7 +198,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             self._load_stream = torch.npu.Stream()
             self._store_stream = torch.npu.Stream()
         model = get_model(self.engine_id)
-        self._executor = Qwen3BlendExecutor(model, self.config)
+        self._executor = Qwen3BlendExecutor(model, self.config, self.block_size)
         self._trace.emit(
             "worker_registered",
             rank=rank,
@@ -661,6 +661,16 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 )
             return BlendPlan(apc_prefix_tokens, apc_prefix_tokens, 0, ())
         plan = BlendPlan.from_segments(apc_prefix_tokens, segments)
+        if plan.segments and self.config.selection_strategy in {"sparse_q", "compare"}:
+            # Sparse-Q must see the trailing non-reuse question, not only gaps
+            # between retrieved segments. Keep one prompt token for vLLM's
+            # regular scheduling step, matching the lookup range above.
+            plan = BlendPlan(
+                apc_prefix_tokens=plan.apc_prefix_tokens,
+                allocation_end=len(tokens) - 1,
+                hit_tokens=plan.hit_tokens,
+                segments=plan.segments,
+            )
         if not plan.passes_gate(
             self.config.min_retrieve_tokens,
             self.config.min_hit_ratio,

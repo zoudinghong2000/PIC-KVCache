@@ -16,6 +16,19 @@ MAX_APC_PREFIX_TO_HIT_RATIO="${MAX_APC_PREFIX_TO_HIT_RATIO:-0.0}"
 LOOKUP_TIMEOUT_MS="${LOOKUP_TIMEOUT_MS:-10000}"
 STORE_WORKERS="${STORE_WORKERS:-1}"
 MAX_INFLIGHT_STORE_BATCHES="${MAX_INFLIGHT_STORE_BATCHES:-8}"
+SELECTION_STRATEGY="${SELECTION_STRATEGY:-kv_deviation}"
+CHECK_LAYER="${CHECK_LAYER:-}"
+RECOMPUTE_RATIO="${RECOMPUTE_RATIO:-0.15}"
+QUERY_SCORE_CHUNK_SIZE="${QUERY_SCORE_CHUNK_SIZE:-8}"
+OVERFLOW_BLOCKS="${OVERFLOW_BLOCKS:-1}"
+TAIL_QUERY_TOKENS="${TAIL_QUERY_TOKENS:-64}"
+if [[ -z "$CHECK_LAYER" ]]; then
+  if [[ "$SELECTION_STRATEGY" == kv_deviation ]]; then
+    CHECK_LAYER=1
+  else
+    CHECK_LAYER=6
+  fi
+fi
 REQUESTS_FILE="${REQUESTS_FILE:-}"
 REPLAY_SCRIPT="${REPLAY_SCRIPT:-/home/zdh/mcts_kv_replay/replay_tree.py}"
 REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-1800}"
@@ -74,7 +87,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":${MIN_SAVED_TOKENS},\"max_apc_prefix_to_hit_ratio\":${MAX_APC_PREFIX_TO_HIT_RATIO},\"check_layers\":[1],\"recompute_ratios\":[0.15],\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true,\"lookup_timeout_ms\":${LOOKUP_TIMEOUT_MS},\"store_workers\":${STORE_WORKERS},\"max_inflight_store_batches\":${MAX_INFLIGHT_STORE_BATCHES}}}"
+KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":${MIN_SAVED_TOKENS},\"max_apc_prefix_to_hit_ratio\":${MAX_APC_PREFIX_TO_HIT_RATIO},\"check_layers\":[${CHECK_LAYER}],\"recompute_ratios\":[${RECOMPUTE_RATIO}],\"selection_strategy\":\"${SELECTION_STRATEGY}\",\"query_score_chunk_size\":${QUERY_SCORE_CHUNK_SIZE},\"overflow_blocks\":${OVERFLOW_BLOCKS},\"tail_query_tokens\":${TAIL_QUERY_TOKENS},\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true,\"lookup_timeout_ms\":${LOOKUP_TIMEOUT_MS},\"store_workers\":${STORE_WORKERS},\"max_inflight_store_batches\":${MAX_INFLIGHT_STORE_BATCHES}}}"
 
 setsid vllm serve "$MODEL" \
   --host 127.0.0.1 \

@@ -18,6 +18,10 @@ class CacheBlendConfig:
     max_apc_prefix_to_hit_ratio: float = 0.0
     check_layers: tuple[int, ...] = (1,)
     recompute_ratios: tuple[float, ...] = (0.15,)
+    selection_strategy: str = "kv_deviation"
+    query_score_chunk_size: int = 8
+    overflow_blocks: int = 1
+    tail_query_tokens: int = 64
     save_decode_cache: bool = False
     tp_global_selection: bool = True
     event_pipeline: bool = True
@@ -72,6 +76,20 @@ class CacheBlendConfig:
             raise ValueError("check layer indices cannot be negative")
         if any(not 0.0 <= ratio <= 1.0 for ratio in self.recompute_ratios):
             raise ValueError("recompute ratios must be between 0 and 1")
+        if self.selection_strategy not in {"kv_deviation", "sparse_q", "compare"}:
+            raise ValueError(
+                "selection_strategy must be kv_deviation, sparse_q, or compare"
+            )
+        if self.selection_strategy != "kv_deviation" and len(self.check_layers) != 1:
+            raise ValueError("Sparse-Q selection requires exactly one check layer")
+        if self.query_score_chunk_size <= 0:
+            raise ValueError("query_score_chunk_size must be positive")
+        if self.overflow_blocks < 0:
+            raise ValueError("overflow_blocks cannot be negative")
+        if self.tail_query_tokens < 0:
+            raise ValueError("tail_query_tokens cannot be negative")
+        if self.selection_strategy != "kv_deviation" and self.tail_query_tokens == 0:
+            raise ValueError("Sparse-Q selection requires tail_query_tokens > 0")
 
     @property
     def max_local_cpu_bytes(self) -> int:
