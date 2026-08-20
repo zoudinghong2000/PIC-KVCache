@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from cacheblend_vllm.connector import CacheBlendConnectorV1
+from cacheblend_vllm.trace import PipelineTracer
 
 
 class RecordingStream:
@@ -53,6 +54,7 @@ def test_wait_for_save_only_orders_paged_gather(monkeypatch):
     current_stream = RecordingStream()
     connector._last_gather_event = gather_event
     connector._pending_offloads = []
+    connector._trace = PipelineTracer("test")
     connector._save_lock = threading.Lock()
     connector._save_futures = set()
     monkeypatch.setattr(torch.npu, "current_stream", lambda: current_stream)
@@ -70,7 +72,8 @@ def test_wait_for_save_defers_d2h_behind_end_of_forward_barrier(monkeypatch):
     contiguous = torch.empty(1)
     pending = [("segment", 0, 1)]
     connector._last_gather_event = gather_event
-    connector._pending_offloads = [(pending, contiguous)]
+    connector._pending_offloads = [("request", pending, contiguous, 123)]
+    connector._trace = PipelineTracer("test")
     connector._save_lock = threading.Lock()
     connector._save_futures = set()
     enqueued = []
@@ -80,8 +83,8 @@ def test_wait_for_save_defers_d2h_behind_end_of_forward_barrier(monkeypatch):
     monkeypatch.setattr(
         connector,
         "_save_contiguous_batch",
-        lambda batch, source, ready_event=None: enqueued.append(
-            (batch, source, ready_event)
+        lambda batch, source, ready_event=None, **kwargs: enqueued.append(
+            (batch, source, ready_event, kwargs)
         ),
     )
 
@@ -92,11 +95,13 @@ def test_wait_for_save_defers_d2h_behind_end_of_forward_barrier(monkeypatch):
     assert enqueued[0][0] is pending
     assert enqueued[0][1] is contiguous
     assert enqueued[0][2].recorded_on is current_stream
+    assert enqueued[0][3]["request_id"] == "request"
 
 
 def test_async_publish_holds_device_staging_until_offload_completes():
     connector = object.__new__(CacheBlendConnectorV1)
     connector._store = RecordingStore()
+    connector._trace = PipelineTracer("test")
     event = BlockingEvent()
     host = torch.arange(8).reshape(2, 4)
     device_staging = torch.empty(1)

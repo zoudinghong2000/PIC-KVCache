@@ -8,6 +8,7 @@ changing the connector contract.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import torch
@@ -16,6 +17,7 @@ from vllm.logger import init_logger
 from .config import CacheBlendConfig
 from .kv_layout import gather_paged_kv, scatter_paged_kv
 from .storage import LocalPinnedCPUStore
+from .trace import PipelineTracer
 from .types import BlendPlan
 
 logger = init_logger(__name__)
@@ -122,6 +124,7 @@ class PagedBlendLoader:
         slot_mapping: torch.Tensor,
         block_size: int,
         config: CacheBlendConfig,
+        tracer: PipelineTracer | None = None,
     ):
         self.kv_caches = kv_caches
         self.store = store
@@ -130,6 +133,7 @@ class PagedBlendLoader:
         self.slot_mapping = slot_mapping[: plan.allocation_end]
         self.block_size = block_size
         self.config = config
+        self.tracer = tracer
         self._buffers: dict[int, torch.Tensor] = {}
         self._events: dict[int, object] = {}
         self._staging: list[torch.Tensor] = []
@@ -148,10 +152,22 @@ class PagedBlendLoader:
         self._load_stream = None
         if _device_name() == "npu" and config.event_pipeline:
             self._load_stream = torch.npu.Stream()
+        if self.tracer is not None and self.tracer.enabled:
+            self.tracer.emit(
+                "loader_initialized",
+                request_id=request_id,
+                apc_prefix_tokens=plan.apc_prefix_tokens,
+                allocation_tokens=plan.allocation_tokens,
+                hit_tokens=plan.hit_tokens,
+                gap_tokens=plan.gap_tokens,
+                segments=len(plan.segments),
+            )
 
     def prefetch(self, layer_id: int, rotary_emb) -> None:
         if layer_id in self._buffers or layer_id >= len(self.kv_caches):
             return
+        trace_enabled = self.tracer is not None and self.tracer.enabled
+        started_ns = time.monotonic_ns() if trace_enabled else 0
 
         def load() -> None:
             kv_layer = self.kv_caches[layer_id]
@@ -180,12 +196,28 @@ class PagedBlendLoader:
 
         if self._load_stream is None:
             load()
+            if trace_enabled:
+                assert self.tracer is not None
+                self.tracer.emit(
+                    "layer_prefetch_enqueued",
+                    request_id=self.request_id,
+                    layer_id=layer_id,
+                    duration_us=(time.monotonic_ns() - started_ns) / 1000,
+                )
             return
         with torch.npu.stream(self._load_stream):
             load()
             event = torch.npu.Event()
             event.record(self._load_stream)
             self._events[layer_id] = event
+        if trace_enabled:
+            assert self.tracer is not None
+            self.tracer.emit(
+                "layer_prefetch_enqueued",
+                request_id=self.request_id,
+                layer_id=layer_id,
+                duration_us=(time.monotonic_ns() - started_ns) / 1000,
+            )
 
     def _zero_gaps(self, buffer: torch.Tensor) -> None:
         cursor = self.plan.apc_prefix_tokens
@@ -283,6 +315,13 @@ class PagedBlendLoader:
         event = self._events.pop(layer_id, None)
         if event is not None:
             torch.npu.current_stream().wait_event(event)
+        if self.tracer is not None and self.tracer.enabled:
+            self.tracer.emit(
+                "layer_prefetch_wait_enqueued",
+                request_id=self.request_id,
+                layer_id=layer_id,
+                had_event=event is not None,
+            )
         return self._buffers.pop(layer_id)
 
     def commit(self, layer_id: int, contiguous: torch.Tensor) -> None:
@@ -301,6 +340,13 @@ class PagedBlendLoader:
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
             self._reuse_events[layer_id % 2] = event
+        if self.tracer is not None and self.tracer.enabled:
+            self.tracer.emit(
+                "layer_committed",
+                request_id=self.request_id,
+                layer_id=layer_id,
+                suffix_tokens=self.plan.allocation_end - start,
+            )
 
 
 class Qwen3BlendExecutor:
@@ -354,6 +400,14 @@ class Qwen3BlendExecutor:
             hidden_states, residual, state, old_kv = self._compute_layer(
                 layer_id, layer, hidden_states, residual, state, old_kv
             )
+            if loader.tracer is not None and loader.tracer.enabled:
+                loader.tracer.emit(
+                    "layer_compute_enqueued",
+                    request_id=request_id,
+                    layer_id=layer_id,
+                    computed_tokens=int(hidden_states.shape[0]),
+                    check_layer=layer_id in self.config.check_layers,
+                )
             loader.commit(layer_id, old_kv)
         logger.info(
             "CacheBlend request %s prepared allocation=%d hits=%d gaps=%d segments=%d",

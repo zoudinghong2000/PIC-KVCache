@@ -114,6 +114,19 @@ REQUESTS_FILE=/path/to/requests.jsonl \
 bash scripts/run_npu_smoke.sh
 ```
 
+For a deterministic CacheBlend-specific comparison of full prefill, native
+APC, and non-contiguous reuse, use the repository benchmark:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=2,3 \
+MODEL=/path/to/qwen3-30b-a3b \
+bash benchmarks/cacheblend/run_suite.sh
+```
+
+It records per-phase TTFT/metrics and can emit an opt-in scheduler/worker
+pipeline trace. See [the benchmark guide](benchmarks/cacheblend/README.md) and
+[the Chinese pipeline walkthrough](docs/BENCHMARK_WALKTHROUGH.md).
+
 ## Validated result
 
 The standalone plugin was validated on 509 ordered requests using

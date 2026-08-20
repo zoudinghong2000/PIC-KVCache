@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,7 @@ from .ipc import LookupServer, TensorParallelLookup, endpoint_uri
 from .kv_layout import gather_paged_kv
 from .registry import get_model
 from .storage import LocalPinnedCPUStore
+from .trace import PipelineTracer
 from .types import BlendPlan, SegmentId
 
 if TYPE_CHECKING:
@@ -117,7 +119,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._save_segments: dict[str, list[tuple[int, SegmentId]]] = {}
         self._save_lock = threading.Lock()
         self._pending_offloads: list[
-            tuple[list[tuple[Any, int, int]], torch.Tensor]
+            tuple[str, list[tuple[Any, int, int]], torch.Tensor, int]
         ] = []
         self._gather_stream: Any | None = None
         self._offload_stream: Any | None = None
@@ -126,6 +128,15 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         # buffers for two full layer stacks so wait_for_save can remain a
         # non-blocking enqueue boundary instead of serializing every prefill.
         self._save_slots = threading.Semaphore(128)
+        component = "scheduler" if role is KVConnectorRole.SCHEDULER else "worker"
+        self._trace = PipelineTracer(component)
+        self._trace.emit(
+            "connector_initialized",
+            engine_id=self.engine_id,
+            model_scope=self.model_scope,
+            role=str(role),
+            tp_size=self.tp_size,
+        )
 
         if role is KVConnectorRole.SCHEDULER:
             uris = [
@@ -183,6 +194,12 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             self._offload_stream = torch.npu.Stream()
         model = get_model(self.engine_id)
         self._executor = Qwen3BlendExecutor(model, self.config)
+        self._trace.emit(
+            "worker_registered",
+            rank=rank,
+            layers=len(self._kv_caches),
+            cpu_cache_bytes=self.config.max_local_cpu_bytes,
+        )
         logger.info(
             "CacheBlend worker rank %d registered %d layers with %.1f GiB CPU cache",
             rank,
@@ -201,6 +218,18 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         for request in metadata.requests:
             if request.plan is None:
                 continue
+            trace_enabled = self._trace.enabled
+            blend_started_ns = time.monotonic_ns() if trace_enabled else 0
+            if trace_enabled:
+                self._trace.emit(
+                    "blend_started",
+                    request_id=request.request_id,
+                    apc_prefix_tokens=request.plan.apc_prefix_tokens,
+                    allocation_tokens=request.plan.allocation_tokens,
+                    hit_tokens=request.plan.hit_tokens,
+                    gap_tokens=request.plan.gap_tokens,
+                    segments=len(request.plan.segments),
+                )
             loader = PagedBlendLoader(
                 self._kv_caches,
                 self._store,
@@ -209,13 +238,16 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 request.slot_mapping,
                 self.block_size,
                 self.config,
+                tracer=self._trace,
             )
             saved_moe_index = getattr(forward_context, "moe_layer_index", None)
             has_layer_idx = hasattr(forward_context, "layer_idx")
             saved_layer_idx = getattr(forward_context, "layer_idx", None)
+            blend_error: str | None = None
             try:
                 self._executor.run(request.request_id, request.token_ids, request.plan, loader)
-            except Exception:
+            except Exception as error:
+                blend_error = type(error).__name__
                 self._record_load_error(request)
                 if not self._recompute_on_failure:
                     raise
@@ -229,6 +261,13 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 if has_layer_idx:
                     forward_context.layer_idx = saved_layer_idx
                 self._store.release(request.request_id)
+                if trace_enabled:
+                    self._trace.emit(
+                        "blend_finished",
+                        request_id=request.request_id,
+                        duration_us=(time.monotonic_ns() - blend_started_ns) / 1000,
+                        error=blend_error,
+                    )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
@@ -279,6 +318,8 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 slot_parts.append(request.slot_mapping[start:end])
             if not pending:
                 continue
+            trace_enabled = self._trace.enabled
+            gather_started_ns = time.monotonic_ns() if trace_enabled else 0
             try:
                 slots = torch.cat(slot_parts)
                 if self._gather_stream is None:
@@ -304,7 +345,23 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                     # model layers. wait_for_save enqueues these transfers
                     # behind an end-of-forward barrier without waiting for
                     # their completion.
-                    self._pending_offloads.append((pending, contiguous))
+                    self._pending_offloads.append(
+                        (
+                            request.request_id,
+                            pending,
+                            contiguous,
+                            time.monotonic_ns() if trace_enabled else 0,
+                        )
+                    )
+                    if trace_enabled:
+                        self._trace.emit(
+                            "save_gather_enqueued",
+                            request_id=request.request_id,
+                            layer_id=layer_id,
+                            chunks=len(pending),
+                            tokens=sum(length for _, _, length in pending),
+                            duration_us=(time.monotonic_ns() - gather_started_ns) / 1000,
+                        )
             except Exception:
                 for segment_id, reserved_layer_id, _ in pending:
                     self._store.cancel_layer(segment_id, reserved_layer_id)
@@ -336,6 +393,8 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         pending: list[tuple[Any, int, int]],
         contiguous: torch.Tensor,
         ready_event: Any | None = None,
+        request_id: str | None = None,
+        gather_enqueued_ns: int | None = None,
     ) -> None:
         assert self._store is not None
         if contiguous.device.type != "npu" or not self.config.async_fingerprint:
@@ -366,6 +425,8 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 pending,
                 host,
                 contiguous,
+                request_id,
+                gather_enqueued_ns,
             )
         except Exception:
             self._save_slots.release()
@@ -373,6 +434,14 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         with self._save_lock:
             self._save_futures.add(future)
         future.add_done_callback(self._save_done)
+        if self._trace.enabled:
+            self._trace.emit(
+                "save_offload_enqueued",
+                request_id=request_id,
+                layer_id=pending[0][1] if pending else None,
+                chunks=len(pending),
+                tokens=sum(length for _, _, length in pending),
+            )
 
     def _publish_host_batch(
         self,
@@ -397,6 +466,8 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         pending: list[tuple[Any, int, int]],
         host: torch.Tensor,
         device_source: torch.Tensor,
+        request_id: str | None = None,
+        gather_enqueued_ns: int | None = None,
     ) -> bool:
         assert self._store is not None
         try:
@@ -406,7 +477,22 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             # let the caching allocator recycle staging while D2H still reads
             # it on the offload stream.
             del device_source
-            return self._publish_host_batch(pending, host)
+            committed = self._publish_host_batch(pending, host)
+            if self._trace.enabled:
+                self._trace.emit(
+                    "save_offload_finished",
+                    request_id=request_id,
+                    layer_id=pending[0][1] if pending else None,
+                    chunks=len(pending),
+                    tokens=sum(length for _, _, length in pending),
+                    duration_us=(
+                        (time.monotonic_ns() - gather_enqueued_ns) / 1000
+                        if gather_enqueued_ns is not None
+                        else None
+                    ),
+                    committed_segment=committed,
+                )
+            return committed
         except Exception:
             for segment_id, layer_id, _ in pending:
                 self._store.cancel_layer(segment_id, layer_id)
@@ -437,16 +523,28 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 # competes with the miss request that produced the cache.
                 offload_ready_event = torch.npu.Event()
                 offload_ready_event.record(current_stream)
-        for index, (pending, contiguous) in enumerate(pending_offloads):
+        if self._trace.enabled:
+            self._trace.emit(
+                "save_gather_barrier_enqueued",
+                offloads=len(pending_offloads),
+            )
+        for index, (
+            request_id,
+            pending,
+            contiguous,
+            gather_enqueued_ns,
+        ) in enumerate(pending_offloads):
             try:
                 self._save_contiguous_batch(
                     pending,
                     contiguous,
                     ready_event=offload_ready_event,
+                    request_id=request_id,
+                    gather_enqueued_ns=gather_enqueued_ns,
                 )
             except Exception:
                 assert self._store is not None
-                for unscheduled, _ in pending_offloads[index:]:
+                for _, unscheduled, _, _ in pending_offloads[index:]:
                     for segment_id, layer_id, _ in unscheduled:
                         self._store.cancel_layer(segment_id, layer_id)
                 raise
@@ -513,7 +611,12 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         # more than the fingerprint scan itself.
         try:
             plan = self._lookup_plan(request_id, tokens, num_computed_tokens)
-        except Exception:
+        except Exception as error:
+            self._trace.emit(
+                "lookup_failed",
+                request_id=request_id,
+                error=type(error).__name__,
+            )
             logger.exception("CacheBlend lookup failed for %s; recomputing", request_id)
             plan = BlendPlan(num_computed_tokens, num_computed_tokens, 0, ())
         self._plans[request_id] = plan
@@ -526,6 +629,15 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         apc_prefix_tokens: int,
     ) -> BlendPlan:
         assert self._lookup is not None
+        trace_enabled = self._trace.enabled
+        lookup_started_ns = time.monotonic_ns() if trace_enabled else 0
+        if trace_enabled:
+            self._trace.emit(
+                "lookup_started",
+                request_id=request_id,
+                prompt_tokens=len(tokens),
+                apc_prefix_tokens=apc_prefix_tokens,
+            )
         # vLLM requires one prompt token to remain for a regular scheduling
         # step. Searching tokens[:-1] avoids a partial final cache segment.
         segments = self._lookup.lookup_and_prefetch(
@@ -536,6 +648,16 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         )
         if request_id in self._cancelled_lookup_ids:
             self._lookup.cancel(request_id)
+            if trace_enabled:
+                self._trace.emit(
+                    "lookup_finished",
+                    request_id=request_id,
+                    duration_us=(time.monotonic_ns() - lookup_started_ns) / 1000,
+                    outcome="cancelled",
+                    apc_prefix_tokens=apc_prefix_tokens,
+                    segments=0,
+                    hit_tokens=0,
+                )
             return BlendPlan(apc_prefix_tokens, apc_prefix_tokens, 0, ())
         plan = BlendPlan.from_segments(apc_prefix_tokens, segments)
         if not plan.passes_gate(
@@ -553,6 +675,18 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 len(plan.segments),
             )
             self._lookup.cancel(request_id)
+            if trace_enabled:
+                self._trace.emit(
+                    "lookup_finished",
+                    request_id=request_id,
+                    duration_us=(time.monotonic_ns() - lookup_started_ns) / 1000,
+                    outcome="rejected",
+                    apc_prefix_tokens=apc_prefix_tokens,
+                    segments=len(plan.segments),
+                    allocation_tokens=plan.allocation_tokens,
+                    hit_tokens=plan.hit_tokens,
+                    gap_tokens=plan.gap_tokens,
+                )
             return BlendPlan(apc_prefix_tokens, apc_prefix_tokens, 0, ())
         logger.info(
             "CacheBlend plan accepted request=%s apc=%d allocation_end=%d "
@@ -564,6 +698,18 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             plan.gap_tokens,
             len(plan.segments),
         )
+        if trace_enabled:
+            self._trace.emit(
+                "lookup_finished",
+                request_id=request_id,
+                duration_us=(time.monotonic_ns() - lookup_started_ns) / 1000,
+                outcome="accepted",
+                apc_prefix_tokens=plan.apc_prefix_tokens,
+                segments=len(plan.segments),
+                allocation_tokens=plan.allocation_tokens,
+                hit_tokens=plan.hit_tokens,
+                gap_tokens=plan.gap_tokens,
+            )
         return plan
 
     def update_state_after_alloc(
@@ -748,6 +894,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             self._lookup = None
         if self._store is not None:
             self._store.clear()
+        self._trace.close()
 
     def __del__(self) -> None:
         try:
