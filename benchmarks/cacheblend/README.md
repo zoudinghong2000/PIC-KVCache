@@ -29,7 +29,8 @@ Every arm receives the same ordered phases:
 
 The default blend request contains four 4,096-token documents. Native APC can
 usually consume the first populated document; the remaining three still exceed
-the connector's default `min_saved_tokens=8192` gate. The complete prompt
+the benchmark profile's `min_saved_tokens=8192` gate (the library default is
+neutral). The complete prompt
 remains below the default `MAX_MODEL_LEN=32768` after separators and the
 question.
 
@@ -55,7 +56,12 @@ include:
 | `RUN_ROOT` | timestamped directory | Result directory |
 | `TP_SIZE` | `2` | Tensor-parallel size |
 | `MAX_MODEL_LEN` | `32768` | vLLM maximum context |
+| `MAX_NUM_SEQS` | `1` | Benchmark concurrency; raise it for serving tests |
 | `LOCAL_CPU_GB` | `16` | CacheBlend CPU cache per TP rank |
+| `MIN_SAVED_TOKENS` | `8192` | Benchmark-only profitability gate |
+| `MAX_APC_PREFIX_TO_HIT_RATIO` | `8.0` | Benchmark-only APC/hit gate |
+| `STORE_WORKERS` | `1` | Host publication worker count |
+| `MAX_INFLIGHT_STORE_BATCHES` | `8` | Store queue backpressure limit |
 | `NUM_DOCUMENTS` | `4` | Warm document corpus size |
 | `DOCUMENT_TOKENS` | `4096` | Exact tokens per generated document |
 | `DOCUMENTS_PER_QUERY` | `4` | Documents in each blend/cold prompt |

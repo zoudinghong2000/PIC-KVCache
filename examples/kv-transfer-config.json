@@ -8,15 +8,16 @@
     "local_cpu_gb": 16,
     "min_retrieve_tokens": 256,
     "min_hit_ratio": 0.1,
-    "min_saved_tokens": 8192,
-    "max_apc_prefix_to_hit_ratio": 8.0,
+    "min_saved_tokens": 0,
+    "max_apc_prefix_to_hit_ratio": 0.0,
     "check_layers": [1],
     "recompute_ratios": [0.15],
-    "async_prefetch": true,
-    "async_fingerprint": true,
     "tp_global_selection": true,
     "event_pipeline": true,
     "fused_segment_copy": true,
-    "cache_attention_mask": true
+    "cache_attention_mask": true,
+    "lookup_timeout_ms": 10000,
+    "store_workers": 1,
+    "max_inflight_store_batches": 8
   }
 }

@@ -15,7 +15,13 @@ VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-2,3}"
 TP_SIZE="${TP_SIZE:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 LOCAL_CPU_GB="${LOCAL_CPU_GB:-16}"
+MIN_SAVED_TOKENS="${MIN_SAVED_TOKENS:-8192}"
+MAX_APC_PREFIX_TO_HIT_RATIO="${MAX_APC_PREFIX_TO_HIT_RATIO:-8.0}"
+LOOKUP_TIMEOUT_MS="${LOOKUP_TIMEOUT_MS:-10000}"
+STORE_WORKERS="${STORE_WORKERS:-1}"
+MAX_INFLIGHT_STORE_BATCHES="${MAX_INFLIGHT_STORE_BATCHES:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-1200}"
 REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-1800}"
@@ -94,7 +100,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":8192,\"max_apc_prefix_to_hit_ratio\":8.0,\"check_layers\":[1],\"recompute_ratios\":[0.15],\"async_prefetch\":true,\"async_fingerprint\":true,\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true}}"
+KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":${MIN_SAVED_TOKENS},\"max_apc_prefix_to_hit_ratio\":${MAX_APC_PREFIX_TO_HIT_RATIO},\"check_layers\":[1],\"recompute_ratios\":[0.15],\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true,\"lookup_timeout_ms\":${LOOKUP_TIMEOUT_MS},\"store_workers\":${STORE_WORKERS},\"max_inflight_store_batches\":${MAX_INFLIGHT_STORE_BATCHES}}}"
 
 VLLM_ARGS=(
   serve "$MODEL"
@@ -105,7 +111,7 @@ VLLM_ARGS=(
   --data-parallel-size 1
   --seed 0
   --max-model-len "$MAX_MODEL_LEN"
-  --max-num-seqs 1
+  --max-num-seqs "$MAX_NUM_SEQS"
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --trust-remote-code

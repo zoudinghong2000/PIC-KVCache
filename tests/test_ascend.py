@@ -1,7 +1,14 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from cacheblend_vllm.ascend import PagedBlendLoader, Qwen3BlendExecutor, relocate_key
+from cacheblend_vllm.ascend import (
+    PagedBlendLoader,
+    Qwen3BlendExecutor,
+    relocate_key,
+    validate_rope_support,
+)
 from cacheblend_vllm.config import CacheBlendConfig
 from cacheblend_vllm.storage import LocalPinnedCPUStore
 from cacheblend_vllm.types import BlendPlan, BlendSegment
@@ -35,6 +42,12 @@ class FakeRope:
         return rotate(query), rotate(key)
 
 
+def supported_rope_cache() -> torch.Tensor:
+    positions = torch.arange(8, dtype=torch.float32).reshape(-1, 1)
+    angles = positions * torch.tensor([[0.1, 0.2]])
+    return torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1)
+
+
 @pytest.mark.parametrize("neox", [False, True])
 def test_relocate_key_matches_fresh_rope(neox):
     rope = FakeRope(neox)
@@ -45,6 +58,39 @@ def test_relocate_key_matches_fresh_rope(neox):
     _, expected = rope(new_positions, raw, raw)
     actual = relocate_key(rope, old_positions, new_positions, encoded_old)
     assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_rope_validation_accepts_only_full_unscaled_rotary_embedding():
+    model = SimpleNamespace(
+        config=SimpleNamespace(rope_scaling=None, partial_rotary_factor=1.0)
+    )
+    rope = SimpleNamespace(head_size=4, rotary_dim=4, cos_sin_cache=supported_rope_cache())
+    validate_rope_support(model, rope)
+
+    model.config.rope_scaling = {"type": "linear", "factor": 2.0}
+    with pytest.raises(ValueError, match="rope_scaling"):
+        validate_rope_support(model, rope)
+    model.config.rope_scaling = None
+
+    model.config.partial_rotary_factor = 0.5
+    with pytest.raises(ValueError, match="partial_rotary_factor"):
+        validate_rope_support(model, rope)
+    model.config.partial_rotary_factor = 1.0
+
+    rope.rotary_dim = 2
+    with pytest.raises(ValueError, match="rotary_dim"):
+        validate_rope_support(model, rope)
+
+
+def test_rope_validation_rejects_non_unit_custom_cache():
+    model = SimpleNamespace(config=SimpleNamespace(rope_scaling=None))
+    rope = SimpleNamespace(
+        head_size=4,
+        rotary_dim=4,
+        cos_sin_cache=torch.ones(8, 4),
+    )
+    with pytest.raises(ValueError, match="unit-norm"):
+        validate_rope_support(model, rope)
 
 
 def test_loader_preserves_apc_prefix_zeroes_gaps_and_scatter_suffix():

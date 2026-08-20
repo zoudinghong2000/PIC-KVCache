@@ -45,16 +45,17 @@ vllm serve MODEL \
       "local_cpu_gb":16,
       "min_retrieve_tokens":256,
       "min_hit_ratio":0.10,
-      "min_saved_tokens":8192,
-      "max_apc_prefix_to_hit_ratio":8.0,
+      "min_saved_tokens":0,
+      "max_apc_prefix_to_hit_ratio":0.0,
       "check_layers":[1],
       "recompute_ratios":[0.15],
-      "async_prefetch":true,
-      "async_fingerprint":true,
       "tp_global_selection":true,
       "event_pipeline":true,
       "fused_segment_copy":true,
-      "cache_attention_mask":true
+      "cache_attention_mask":true,
+      "lookup_timeout_ms":10000,
+      "store_workers":1,
+      "max_inflight_store_batches":8
     }
   }'
 ```
@@ -78,18 +79,23 @@ completed suffix into vLLM-owned pages before the regular one-token forward.
 | `local_cpu_gb` | `16` | Per-rank pinned-CPU cache capacity |
 | `min_retrieve_tokens` | `256` | Minimum exact hit tokens to activate blending |
 | `min_hit_ratio` | `0.10` | Minimum hits / allocated blend span |
-| `min_saved_tokens` | `8192` | Minimum exact hits needed to amortize the side forward |
-| `max_apc_prefix_to_hit_ratio` | `8.0` | Skip when gathering the APC prefix dominates hits; `0` disables |
+| `min_saved_tokens` | `0` | Workload-specific minimum exact hits; `0` disables this gate |
+| `max_apc_prefix_to_hit_ratio` | `0.0` | Skip when gathering the APC prefix dominates hits; `0` disables |
 | `check_layers` | `[1]` | Layers that score cached K error |
 | `recompute_ratios` | `[0.15]` | Cached-token fraction retained at each check layer |
 | `save_decode_cache` | `false` | Store decode KV as well as complete prompt chunks |
+| `lookup_timeout_ms` | `10000` | Per-rank local lookup RPC timeout |
+| `store_workers` | `1` | Host publication workers behind the ordered Store stream |
+| `max_inflight_store_batches` | `8` | Maximum queued layer D2H batches before backpressure |
 | `ipc_root` | `/tmp/cacheblend-v1` | Local scheduler/worker Unix-socket root |
 | `model_scope` | automatic | Optional explicit cache namespace |
 | `strict_version_check` | `true` | Require the vLLM 0.18 package line |
 
 Unknown fields fail at startup. The implementation also fails fast for
 pipeline parallelism because its layerwise executor currently assumes all
-decoder layers are local.
+decoder layers are local. Profitability gates are intentionally neutral in the
+library; the benchmark profile sets `min_saved_tokens=8192` and
+`max_apc_prefix_to_hit_ratio=8.0` for its Qwen3-30B workload.
 
 ## Validate
 

@@ -5,11 +5,12 @@ plugin interfaces. Upstream vLLM and vLLM-Ascend do not need patches.
 
 ## Process boundaries
 
-The scheduler-side Connector owns synchronous local lookup state and lightweight
-request/block trackers. Each TP worker owns an independent pinned-CPU store and
-a local Unix-socket lookup server. Rank 0 proposes token-range matches; every
-rank validates and pins the exact intersection before the scheduler allocates
-the corresponding vLLM pages.
+The scheduler-side Connector owns asynchronous lookup futures and lightweight
+request/block trackers. A single ordered background client keeps Unix-socket
+waits off the scheduler thread. Each TP worker owns an independent pinned-CPU
+store and a local lookup server. Rank 0 proposes token-range matches; every rank
+validates and pins the exact intersection before the scheduler allocates the
+corresponding vLLM pages.
 
 Lookup clients keep one REQ socket per rank for the engine lifetime. The
 scheduler sends only the token suffix not already covered by APC, sends rank
@@ -58,8 +59,9 @@ implementation; it is not a forward hook.
    immediately queues D2H on that same stream. `wait_for_save` synchronizes the
    Store stream and host publication, so vLLM's pages are safe to reuse and the
    new cache is visible before the request leaves the save boundary. Chunk
-   identities are hashed once per request, and stored tensor views retain their
-   pinned batch owner to avoid a second CPU copy. Fingerprints are published
+   identities are hashed once per request, one device staging tensor is reused
+   across that request's layers, and stored tensor views retain their pinned
+   host batch owner to avoid a second CPU copy. Fingerprints are published
    atomically only after every layer's D2H has completed.
 
 The loader double-buffers its per-layer staging tensors. An event prevents a
@@ -70,16 +72,18 @@ planes directly into one reusable NPU hit buffer; source/target position tensors
 are built once per request. This follows LMCache-Ascend's fused-transfer layout
 without importing its runtime or rebuilding a fused CPU tensor for every layer.
 For writeback, the Ascend paged-cache operator writes K and V directly into the
-two planes of a single staging allocation. The asynchronous Future retains that
-device allocation until its D2H event completes, so allocator reuse cannot race
-the Store stream. Serving, Load, and Store are the only NPU stream roles owned
-by the data path.
+two planes of the request's reusable staging allocation. Store-stream ordering
+prevents reuse until the prior D2H has consumed it, and `wait_for_save` releases
+the allocation only after the stream completes. Serving, Load, and Store are
+the only NPU stream roles owned by the data path.
 
 ## Correctness invariants
 
 - Fingerprint collisions are verified against the complete token chunk.
 - Match segments are sorted, non-overlapping, and never overlap the APC prefix.
 - A cache entry is not discoverable until all layers have committed.
+- An incomplete or failed entry is discarded as a unit, and in-flight data
+  never exceeds the configured CPU byte limit.
 - vLLM paged blocks are not reusable until the Store stream has completed its
   paged reads; `wait_for_save` also waits for D2H and host publication.
 - TP uses an exact segment intersection; a partial-rank hit is a miss.

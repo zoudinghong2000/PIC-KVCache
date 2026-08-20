@@ -1,10 +1,15 @@
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 from cacheblend_vllm.config import CacheBlendConfig
 from cacheblend_vllm.connector import CacheBlendConnectorV1, RequestMetadata
 from cacheblend_vllm.hashing import content_hash
+from cacheblend_vllm.trace import PipelineTracer
 from cacheblend_vllm.types import BlendPlan, SegmentId
 
 
@@ -131,3 +136,44 @@ def test_save_segment_hashes_are_built_once_per_request():
 
     assert connector._request_save_segments(request, 12) == grown
     assert len(connector._store.calls) == 3
+
+
+def test_scheduler_lookup_is_submitted_and_polled_without_blocking(monkeypatch):
+    connector = make_connector()
+    connector._role = KVConnectorRole.SCHEDULER
+    connector._lookup_pool = ThreadPoolExecutor(max_workers=1)
+    connector._lookup_futures = {}
+    connector._lookup_state_lock = threading.Lock()
+    connector._cancelled_lookup_ids = set()
+    connector._trace = PipelineTracer("test")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def lookup_plan(_request_id, _tokens, apc_prefix_tokens):
+        entered.set()
+        assert release.wait(timeout=5)
+        return BlendPlan(apc_prefix_tokens, apc_prefix_tokens, 0, ())
+
+    monkeypatch.setattr(connector, "_lookup_plan", lookup_plan)
+    request = SimpleNamespace(
+        request_id="async",
+        prompt_token_ids=list(range(12)),
+        lora_request=None,
+        mm_features=[],
+        prompt_embeds=None,
+    )
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, True)
+    assert entered.wait(timeout=2)
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, True)
+
+    release.set()
+    deadline = time.monotonic() + 2
+    result = (None, True)
+    while result[1] and time.monotonic() < deadline:
+        result = connector.get_num_new_matched_tokens(request, 0)
+        time.sleep(0.001)
+    assert result == (0, False)
+
+    connector._lookup_pool.shutdown(wait=True)
+    connector._lookup_pool = None

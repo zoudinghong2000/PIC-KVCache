@@ -103,6 +103,61 @@ def relocate_key(
     return relocated.reshape(original_shape)
 
 
+def validate_rope_support(model, rotary_emb) -> None:
+    """Fail closed for RoPE variants not validated by CacheBlend.
+
+    LMCache-Ascend only enables key relocation for full-dimensional, unscaled
+    RoPE. Keep the same boundary here: silently relocating an unsupported key
+    is worse than declining to start the connector.
+    """
+    head_size = int(rotary_emb.head_size)
+    rotary_dim = int(getattr(rotary_emb, "rotary_dim", head_size))
+    if rotary_dim != head_size:
+        raise ValueError(
+            "CacheBlend requires rotary_dim == head_size; "
+            f"got rotary_dim={rotary_dim}, head_size={head_size}"
+        )
+
+    model_config = getattr(model, "config", None)
+    rope_scaling = getattr(model_config, "rope_scaling", None)
+    if rope_scaling:
+        raise ValueError("CacheBlend does not support rope_scaling")
+    partial_factor = getattr(model_config, "partial_rotary_factor", 1.0)
+    partial_factor = 1.0 if partial_factor is None else float(partial_factor)
+    if partial_factor != 1.0:
+        raise ValueError(
+            "CacheBlend requires partial_rotary_factor=1.0; "
+            f"got {partial_factor}"
+        )
+
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    if not isinstance(cache, torch.Tensor) or cache.ndim != 2:
+        raise ValueError("CacheBlend requires a two-dimensional RoPE cos_sin_cache")
+    if cache.shape[0] == 0:
+        raise ValueError("CacheBlend requires a non-empty RoPE cos_sin_cache")
+    if cache.shape[-1] != rotary_dim:
+        raise ValueError(
+            "CacheBlend RoPE cache width does not match rotary_dim: "
+            f"cache={cache.shape[-1]}, rotary_dim={rotary_dim}"
+        )
+    # The config check above rejects frequency scaling. This additional check
+    # catches amplitude-scaled custom classes that omit their metadata, where
+    # R(new) R(old)^T is not an inverse relocation.
+    sample_indices = torch.tensor(
+        sorted({0, max(0, cache.shape[0] - 1)}),
+        dtype=torch.long,
+        device=cache.device,
+    )
+    sample = cache.index_select(0, sample_indices).float()
+    cosine, sine = sample.chunk(2, dim=-1)
+    max_norm_error = (cosine.square() + sine.square() - 1.0).abs().max().item()
+    if max_norm_error > 0.05:
+        raise ValueError(
+            "CacheBlend requires unit-norm, unscaled RoPE; "
+            f"maximum sampled norm error is {max_norm_error:.4f}"
+        )
+
+
 @dataclass(slots=True)
 class BlendExecutionState:
     compute_start: int
@@ -125,6 +180,7 @@ class PagedBlendLoader:
         block_size: int,
         config: CacheBlendConfig,
         tracer: PipelineTracer | None = None,
+        load_stream: object | None = None,
     ):
         self.kv_caches = kv_caches
         self.store = store
@@ -151,7 +207,9 @@ class PagedBlendLoader:
         )
         self._load_stream = None
         if _device_name() == "npu" and config.event_pipeline:
-            self._load_stream = torch.npu.Stream()
+            # The connector normally supplies one persistent Load stream. Keep
+            # a fallback for direct loader construction in tests/tools.
+            self._load_stream = load_stream or torch.npu.Stream()
         if self.tracer is not None and self.tracer.enabled:
             self.tracer.emit(
                 "loader_initialized",
@@ -354,6 +412,9 @@ class Qwen3BlendExecutor:
         self.model = model
         self.config = config
         self.layers = list(model.model.layers[model.model.start_layer : model.model.end_layer])
+        if not self.layers:
+            raise RuntimeError("Qwen3 model has no local decoder layers")
+        validate_rope_support(model, self.layers[0].self_attn.rotary_emb)
         try:
             from vllm.distributed.parallel_state import get_tp_group
 
@@ -390,8 +451,6 @@ class Qwen3BlendExecutor:
             gap_mask[segment.target_start : segment.target_end] = False
         state = BlendExecutionState(plan.apc_prefix_tokens, positions, gap_mask)
 
-        if not self.layers:
-            raise RuntimeError("Qwen3 model has no local decoder layers")
         loader.prefetch(0, self.layers[0].self_attn.rotary_emb)
         for layer_id, layer in enumerate(self.layers):
             old_kv = loader.get(layer_id)

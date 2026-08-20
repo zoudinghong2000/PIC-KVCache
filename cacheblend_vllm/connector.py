@@ -101,7 +101,10 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             raise ValueError("CacheBlendConnectorV1 currently requires pipeline_parallel_size=1")
         self.model_scope = self.config.model_scope or self._make_model_scope(vllm_config)
 
+        self._lookup_pool: ThreadPoolExecutor | None = None
         self._lookup: TensorParallelLookup | None = None
+        self._lookup_futures: dict[str, Future[BlendPlan]] = {}
+        self._lookup_state_lock = threading.Lock()
         self._cancelled_lookup_ids: set[str] = set()
         self._plans: dict[str, BlendPlan] = {}
         self._load_requests: dict[str, Request] = {}
@@ -117,13 +120,13 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._save_pool: ThreadPoolExecutor | None = None
         self._save_futures: set[Future[bool]] = set()
         self._save_segments: dict[str, list[tuple[int, SegmentId]]] = {}
-        self._pending_store_request_ids: set[str] = set()
+        self._pending_store_counts: dict[str, int] = {}
         self._save_lock = threading.Lock()
+        self._load_stream: Any | None = None
         self._store_stream: Any | None = None
-        # A Qwen3 request emits one transfer per layer.  Keep enough pinned
-        # buffers for two full layer stacks so Store can overlap Serving while
-        # retaining every staging allocation until its D2H event completes.
-        self._save_slots = threading.Semaphore(128)
+        self._store_staging_by_request: dict[str, torch.Tensor] = {}
+        self._retired_store_staging: list[torch.Tensor] = []
+        self._save_slots = threading.Semaphore(self.config.max_inflight_store_batches)
         component = "scheduler" if role is KVConnectorRole.SCHEDULER else "worker"
         self._trace = PipelineTracer(component)
         self._trace.emit(
@@ -139,7 +142,17 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 endpoint_uri(self.config.ipc_root, self.engine_id, rank)
                 for rank in range(self.tp_size)
             ]
-            self._lookup = TensorParallelLookup(uris)
+            self._lookup = TensorParallelLookup(
+                uris,
+                timeout_ms=self.config.lookup_timeout_ms,
+            )
+            # Worker lookup servers are single-threaded REP endpoints. One
+            # background client preserves ZeroMQ REQ ordering while keeping
+            # network waits off vLLM's scheduler thread.
+            self._lookup_pool = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="cacheblend-lookup",
+            )
 
     @staticmethod
     def _make_model_scope(vllm_config: VllmConfig) -> str:
@@ -173,7 +186,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._server = LookupServer(self.config.ipc_root, self.engine_id, rank, self._store)
         self._server.start()
         self._save_pool = ThreadPoolExecutor(
-            max_workers=8,
+            max_workers=self.config.store_workers,
             thread_name_prefix=f"cacheblend-save-rank-{rank}",
         )
         first_cache = self._kv_caches[0]
@@ -182,6 +195,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             # Match LMCache's layerwise writeback topology: one default-priority
             # Store stream owns both paged-KV gather and the following D2H copy.
             # The separate CacheBlend loader continues to own its Load stream.
+            self._load_stream = torch.npu.Stream()
             self._store_stream = torch.npu.Stream()
         model = get_model(self.engine_id)
         self._executor = Qwen3BlendExecutor(model, self.config)
@@ -230,6 +244,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 self.block_size,
                 self.config,
                 tracer=self._trace,
+                load_stream=self._load_stream,
             )
             saved_moe_index = getattr(forward_context, "moe_layer_index", None)
             has_layer_idx = hasattr(forward_context, "layer_idx")
@@ -313,7 +328,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             store_started_ns = time.monotonic_ns() if trace_enabled else 0
             try:
                 slots = torch.cat(slot_parts)
-                if self._store_stream is None or not self.config.async_fingerprint:
+                if self._store_stream is None:
                     contiguous = gather_paged_kv(
                         kv_layer,
                         slots,
@@ -342,7 +357,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                         )
             except Exception:
                 for segment_id, reserved_layer_id, _ in pending:
-                    self._store.cancel_layer(segment_id, reserved_layer_id)
+                    self._store.abort_put(segment_id)
                 raise
 
     def _request_save_segments(
@@ -371,7 +386,7 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         pending: list[tuple[Any, int, int]],
         kv_layer: Any,
         slots: torch.Tensor,
-        request_id: str | None = None,
+        request_id: str,
         store_enqueued_ns: int | None = None,
     ) -> None:
         """Enqueue paged gather and D2H on the single Store stream."""
@@ -383,11 +398,26 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             current_stream = torch.npu.current_stream()
             with torch.npu.stream(self._store_stream):
                 self._store_stream.wait_stream(current_stream)
-                contiguous = gather_paged_kv(
-                    kv_layer,
-                    slots,
-                    self.block_size,
-                ).contiguous()
+                contiguous = self._store_staging_by_request.get(request_id)
+                if contiguous is None or contiguous.shape[1] != slots.numel():
+                    if contiguous is not None:
+                        # Capacity rejection can shrink a later layer's pending
+                        # segment set. Retain the old shape until Store drains;
+                        # its preceding D2H may still reference the allocation.
+                        self._retired_store_staging.append(contiguous)
+                    contiguous = gather_paged_kv(
+                        kv_layer,
+                        slots,
+                        self.block_size,
+                    ).contiguous()
+                    self._store_staging_by_request[request_id] = contiguous
+                else:
+                    gather_paged_kv(
+                        kv_layer,
+                        slots,
+                        self.block_size,
+                        out=contiguous,
+                    )
                 host = torch.empty(
                     contiguous.shape,
                     dtype=contiguous.dtype,
@@ -403,7 +433,6 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 store_event,
                 pending,
                 host,
-                contiguous,
                 request_id,
                 store_enqueued_ns,
             )
@@ -412,8 +441,9 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             raise
         with self._save_lock:
             self._save_futures.add(future)
-            if request_id is not None:
-                self._pending_store_request_ids.add(request_id)
+            self._pending_store_counts[request_id] = (
+                self._pending_store_counts.get(request_id, 0) + 1
+            )
         future.add_done_callback(self._save_done)
 
     def _publish_host_batch(
@@ -429,7 +459,9 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             # also keeps its parent allocation alive and avoids a second CPU
             # memcpy for every 256-token chunk and layer.
             layer_host = host[:, offset : offset + length]
-            committed |= self._store.put_layer_host(segment_id, layer_id, layer_host)
+            result = self._store.put_layer_host(segment_id, layer_id, layer_host)
+            if result is not None:
+                committed |= result
             offset += length
         return committed
 
@@ -438,18 +470,12 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         event: Any,
         pending: list[tuple[Any, int, int]],
         host: torch.Tensor,
-        device_source: torch.Tensor,
         request_id: str | None = None,
         store_enqueued_ns: int | None = None,
     ) -> bool:
         assert self._store is not None
         try:
             event.synchronize()
-            # ``device_source`` is intentionally held by this future until the
-            # Store event completes.  Dropping the last reference sooner can
-            # let the caching allocator recycle staging while D2H still reads
-            # it on the Store stream.
-            del device_source
             committed = self._publish_host_batch(pending, host)
             if self._trace.enabled:
                 self._trace.emit(
@@ -467,9 +493,10 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 )
             return committed
         except Exception:
-            for segment_id, layer_id, _ in pending:
-                self._store.cancel_layer(segment_id, layer_id)
-            raise
+            for segment_id, _, _ in pending:
+                self._store.abort_put(segment_id)
+            logger.exception("CacheBlend Store publication failed for %s", request_id)
+            return False
 
     def _save_done(self, future: Future[bool]) -> None:
         self._save_slots.release()
@@ -477,42 +504,56 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self) -> None:
         """Wait until the single Store stream and host publication complete."""
         started_ns = time.monotonic_ns() if self._trace.enabled else 0
-        if self._store_stream is not None:
-            self._store_stream.synchronize()
-        with self._save_lock:
-            futures = tuple(self._save_futures)
-            request_ids = tuple(self._pending_store_request_ids)
-            self._pending_store_request_ids.clear()
-        for future in futures:
-            future.result()
-        with self._save_lock:
-            self._save_futures.difference_update(futures)
+        futures: tuple[Future[bool], ...] = ()
+        store_counts: dict[str, int] = {}
+        try:
+            if self._store_stream is not None:
+                self._store_stream.synchronize()
+            with self._save_lock:
+                futures = tuple(self._save_futures)
+                store_counts = dict(self._pending_store_counts)
+                self._pending_store_counts.clear()
+            for future in futures:
+                future.result()
+        finally:
+            with self._save_lock:
+                self._save_futures.difference_update(futures)
+            # Gather and D2H are ordered on one Store stream, so one staging
+            # tensor per request can be reused across every layer. It is safe
+            # to release those tensors only after the Store boundary above.
+            self._store_staging_by_request.clear()
+            self._retired_store_staging.clear()
         if self._trace.enabled:
             duration_us = (time.monotonic_ns() - started_ns) / 1000
-            for request_id in request_ids:
+            for request_id, stores in store_counts.items():
                 self._trace.emit(
                     "save_store_wait_finished",
                     request_id=request_id,
-                    stores=len(futures),
+                    stores=stores,
                     duration_us=duration_us,
                 )
 
     def _drain_saves(self) -> None:
-        while True:
-            with self._save_lock:
-                futures = tuple(self._save_futures)
-            if not futures:
-                return
-            for future in futures:
-                future.result()
-            with self._save_lock:
-                self._save_futures.difference_update(futures)
+        try:
+            while True:
+                with self._save_lock:
+                    futures = tuple(self._save_futures)
+                if not futures:
+                    return
+                for future in futures:
+                    future.result()
+                with self._save_lock:
+                    self._save_futures.difference_update(futures)
+        finally:
+            self._store_staging_by_request.clear()
+            self._retired_store_staging.clear()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         if self._store is not None:
             for request_id in finished_req_ids:
                 self._store.release(request_id)
-                self._save_segments.pop(request_id, None)
+                for _, segment_id in self._save_segments.pop(request_id, ()):
+                    self._store.abort_put(segment_id)
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -536,23 +577,38 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         if self.role is not KVConnectorRole.SCHEDULER:
             return 0, False
         request_id = request.request_id
-        self._cancelled_lookup_ids.discard(request_id)
+        with self._lookup_state_lock:
+            self._cancelled_lookup_ids.discard(request_id)
         self._request_objects[request_id] = request
         if not self._is_cacheable(request):
             return 0, False
         existing = self._plans.get(request_id)
         if existing is not None:
             return max(0, existing.allocation_end - num_computed_tokens), False
-        tokens = list(request.prompt_token_ids or [])
-        if len(tokens) - num_computed_tokens <= self.config.chunk_size:
-            self._plans[request_id] = BlendPlan(num_computed_tokens, num_computed_tokens, 0, ())
-            return 0, False
-        # Resolve the local-CPU lookup in this scheduler pass. Returning None
-        # makes vLLM repeat its full APC block lookup and defer the request to a
-        # later engine step; for local UDS, that scheduling round costs much
-        # more than the fingerprint scan itself.
+        future = self._lookup_futures.get(request_id)
+        if future is None:
+            tokens = list(request.prompt_token_ids or [])
+            if len(tokens) - num_computed_tokens <= self.config.chunk_size:
+                self._plans[request_id] = BlendPlan(
+                    num_computed_tokens,
+                    num_computed_tokens,
+                    0,
+                    (),
+                )
+                return 0, False
+            assert self._lookup_pool is not None
+            self._lookup_futures[request_id] = self._lookup_pool.submit(
+                self._lookup_plan,
+                request_id,
+                tokens,
+                num_computed_tokens,
+            )
+            return None, True
+        if not future.done():
+            return None, True
+        del self._lookup_futures[request_id]
         try:
-            plan = self._lookup_plan(request_id, tokens, num_computed_tokens)
+            plan = future.result()
         except Exception as error:
             self._trace.emit(
                 "lookup_failed",
@@ -588,8 +644,11 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
             tokens[:-1],
             apc_prefix_tokens,
         )
-        if request_id in self._cancelled_lookup_ids:
-            self._lookup.cancel(request_id)
+        with self._lookup_state_lock:
+            cancelled = request_id in self._cancelled_lookup_ids
+        if cancelled:
+            # Cleanup has already queued CANCEL behind this ordered lookup.
+            # Return without issuing a duplicate ZeroMQ round trip here.
             if trace_enabled:
                 self._trace.emit(
                     "lookup_finished",
@@ -813,13 +872,28 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         return False, None
 
     def _cleanup_scheduler_request(self, request_id: str) -> None:
-        self._cancelled_lookup_ids.add(request_id)
+        future = self._lookup_futures.pop(request_id, None)
+        if future is not None and not future.cancel():
+            # Match LMCache's abort semantics: a running lookup owns its REQ
+            # socket until completion, then observes this marker and releases
+            # any rank-local pins it created.
+            with self._lookup_state_lock:
+                self._cancelled_lookup_ids.add(request_id)
         self._plans.pop(request_id, None)
         self._load_requests.pop(request_id, None)
         self._request_objects.pop(request_id, None)
         self._scheduler_requests.pop(request_id, None)
+        if self._lookup is not None and self._lookup_pool is not None:
+            # The pool has one worker because the persistent ZeroMQ REQ sockets
+            # are ordered and not thread-safe. This cancel therefore runs after
+            # any in-flight lookup without blocking the scheduler.
+            self._lookup_pool.submit(self._cancel_lookup, request_id)
+
+    def _cancel_lookup(self, request_id: str) -> None:
         if self._lookup is not None:
             self._lookup.cancel(request_id)
+        with self._lookup_state_lock:
+            self._cancelled_lookup_ids.discard(request_id)
 
     def close(self) -> None:
         try:
@@ -831,6 +905,9 @@ class CacheBlendConnectorV1(KVConnectorBase_V1, SupportsHMA):
         if self._server is not None:
             self._server.close()
             self._server = None
+        if self._lookup_pool is not None:
+            self._lookup_pool.shutdown(wait=True, cancel_futures=False)
+            self._lookup_pool = None
         if self._lookup is not None:
             self._lookup.close()
             self._lookup = None

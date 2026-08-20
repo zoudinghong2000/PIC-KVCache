@@ -58,8 +58,10 @@ vLLM 先做自己的 block hash lookup，并把 `num_computed_tokens` 传给 Con
 CacheBlend 只搜索这个位置之后的 token。这样 APC 擅长的连续前缀仍由 vLLM
 管理，插件只负责 APC 无法表达的内部、非连续文档命中。
 
-对应入口是 `CacheBlendConnectorV1.get_num_new_matched_tokens()`。它同步调用
-`_lookup_plan()`，因为本机 Unix socket 查找比让 scheduler 再空转一轮更便宜。
+对应入口是 `CacheBlendConnectorV1.get_num_new_matched_tokens()`。第一次调用把
+`_lookup_plan()` 提交给单线程 lookup worker，并返回 pending；后续 scheduler
+轮询 Future。这样 Unix socket 等待不会阻塞 scheduler，同时单线程保证持久化
+ZeroMQ REQ socket 的严格收发顺序。
 
 ### 3. scheduler 向所有 TP rank 查找并固定缓存
 

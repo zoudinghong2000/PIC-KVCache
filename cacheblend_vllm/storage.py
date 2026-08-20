@@ -28,6 +28,7 @@ class _Entry:
     size_bytes: int = 0
     pin_count: int = 0
     committed: bool = False
+    failed: bool = False
     last_access: float = field(default_factory=time.monotonic)
 
 
@@ -74,8 +75,14 @@ class LocalPinnedCPUStore:
             self._entries[record.segment_id] = _Entry(record=record, num_layers=num_layers)
         return record.segment_id
 
-    def put_layer(self, segment_id: SegmentId, layer_id: int, kv: torch.Tensor) -> bool:
-        """Store one layer and return whether the segment became committed."""
+    def put_layer(
+        self, segment_id: SegmentId, layer_id: int, kv: torch.Tensor
+    ) -> bool | None:
+        """Store one layer.
+
+        Returns whether the segment became committed, or ``None`` when the
+        segment was rejected to preserve the hard memory limit.
+        """
         with self._lock:
             entry = self._entries.get(segment_id)
             if entry is None:
@@ -102,10 +109,10 @@ class LocalPinnedCPUStore:
         with self._lock:
             entry = self._entries.get(segment_id)
             if entry is None:
-                raise KeyError(segment_id)
+                return False
             if not 0 <= layer_id < entry.num_layers:
                 raise ValueError(f"layer {layer_id} is outside [0, {entry.num_layers})")
-            if layer_id in entry.layers or layer_id in entry.reserved_layers:
+            if entry.failed or layer_id in entry.layers or layer_id in entry.reserved_layers:
                 return False
             entry.reserved_layers.add(layer_id)
             return True
@@ -116,7 +123,9 @@ class LocalPinnedCPUStore:
             if entry is None:
                 return
             entry.reserved_layers.discard(layer_id)
-            if not entry.layers and not entry.reserved_layers and not entry.pin_count:
+            if not entry.committed:
+                entry.failed = True
+            if entry.failed and not entry.reserved_layers and not entry.pin_count:
                 self._remove_unlocked(segment_id, entry)
 
     def put_layer_host(
@@ -124,23 +133,52 @@ class LocalPinnedCPUStore:
         segment_id: SegmentId,
         layer_id: int,
         cpu_tensor: torch.Tensor,
-    ) -> bool:
-        """Publish an owned CPU tensor or view without another copy."""
+    ) -> bool | None:
+        """Publish an owned CPU tensor or view without another copy.
+
+        ``None`` means that the whole incomplete segment was rejected or
+        aborted. This fail-closed result is distinct from ``False``, which
+        means the layer was accepted but more layers are still required.
+        """
         if cpu_tensor.device.type != "cpu":
             raise ValueError("put_layer_host requires a CPU tensor")
         with self._lock:
             entry = self._entries.get(segment_id)
             if entry is None:
-                return False
+                return None
             if not 0 <= layer_id < entry.num_layers:
                 raise ValueError(f"layer {layer_id} is outside [0, {entry.num_layers})")
-            entry.reserved_layers.discard(layer_id)
+            if entry.failed:
+                entry.reserved_layers.discard(layer_id)
+                if not entry.reserved_layers and not entry.pin_count:
+                    self._remove_unlocked(segment_id, entry)
+                return None
+            if entry.committed:
+                # Immutable content-addressed entries are never overwritten.
+                # The async path normally filters this in reserve_layer.
+                entry.reserved_layers.discard(layer_id)
+                return False
             previous = entry.layers.get(layer_id)
-            if previous is not None:
-                self._bytes -= previous.numel() * previous.element_size()
-                entry.size_bytes -= previous.numel() * previous.element_size()
-            entry.layers[layer_id] = cpu_tensor
+            previous_size = (
+                previous.numel() * previous.element_size() if previous is not None else 0
+            )
             added = cpu_tensor.numel() * cpu_tensor.element_size()
+            growth = added - previous_size
+            if growth > 0:
+                self._evict_unlocked(required_bytes=growth, exclude=segment_id)
+            if self._bytes + growth > self.max_bytes:
+                # LMCache-style fail-closed reservation: never expose a partial
+                # entry and never let in-flight data exceed the configured cap.
+                entry.reserved_layers.discard(layer_id)
+                entry.failed = True
+                if not entry.reserved_layers and not entry.pin_count:
+                    self._remove_unlocked(segment_id, entry)
+                return None
+            entry.reserved_layers.discard(layer_id)
+            if previous is not None:
+                self._bytes -= previous_size
+                entry.size_bytes -= previous_size
+            entry.layers[layer_id] = cpu_tensor
             entry.size_bytes += added
             self._bytes += added
             entry.last_access = time.monotonic()
@@ -149,15 +187,16 @@ class LocalPinnedCPUStore:
                 entry.committed = True
                 self.matcher.register(entry.record)
             self._touch(segment_id, entry)
-            self._evict_unlocked()
             return became_committed
 
     def abort_put(self, segment_id: SegmentId) -> None:
         with self._lock:
             entry = self._entries.get(segment_id)
-            if entry is None or entry.pin_count:
+            if entry is None or entry.committed:
                 return
-            self._remove_unlocked(segment_id, entry)
+            entry.failed = True
+            if not entry.reserved_layers and not entry.pin_count:
+                self._remove_unlocked(segment_id, entry)
 
     def match(
         self,
@@ -240,15 +279,16 @@ class LocalPinnedCPUStore:
         self._entries.pop(segment_id, None)
         self._bytes -= entry.size_bytes
 
-    def _evict_unlocked(self) -> None:
-        if self._bytes <= self.max_bytes:
+    def _evict_unlocked(
+        self,
+        required_bytes: int = 0,
+        exclude: SegmentId | None = None,
+    ) -> None:
+        if self._bytes + required_bytes <= self.max_bytes:
             return
         for segment_id, entry in list(self._entries.items()):
-            if self._bytes <= self.max_bytes:
+            if self._bytes + required_bytes <= self.max_bytes:
                 break
-            # An in-progress layerwise write is atomic from the matcher's point
-            # of view. Evict it only through abort_put; otherwise a later layer
-            # would write into a segment that disappeared mid-commit.
-            if entry.pin_count or not entry.committed:
+            if segment_id == exclude or entry.pin_count or not entry.committed:
                 continue
             self._remove_unlocked(segment_id, entry)

@@ -20,12 +20,19 @@ def test_config_normalizes_sequences_and_rejects_unknown_fields():
     )
     assert config.check_layers == (2,)
     assert config.recompute_ratios == (0.25,)
-    assert config.min_saved_tokens == 8192
-    assert config.max_apc_prefix_to_hit_ratio == 8.0
+    assert config.min_saved_tokens == 0
+    assert config.max_apc_prefix_to_hit_ratio == 0.0
+    assert config.lookup_timeout_ms == 10_000
+    assert config.store_workers == 1
+    assert config.max_inflight_store_batches == 8
     with pytest.raises(ValueError, match="Unknown"):
         CacheBlendConfig.from_extra_config({"typo": True})
     with pytest.raises(ValueError, match="prefix"):
         CacheBlendConfig.from_extra_config({"max_apc_prefix_to_hit_ratio": -1})
+    with pytest.raises(ValueError, match="store_workers"):
+        CacheBlendConfig.from_extra_config({"store_workers": 0})
+    with pytest.raises(ValueError, match="Unknown"):
+        CacheBlendConfig.from_extra_config({"async_fingerprint": True})
 
 
 def test_registry_is_engine_scoped_and_does_not_own_model_lifetime():

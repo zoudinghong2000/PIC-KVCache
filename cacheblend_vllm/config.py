@@ -12,20 +12,20 @@ class CacheBlendConfig:
     local_cpu_gb: float = 16.0
     min_retrieve_tokens: int = 256
     min_hit_ratio: float = 0.10
-    # A 48-layer side forward has a material fixed cost on Ascend. The full
-    # replay turns profitable at roughly 8K exact hits, so reject tiny matches
-    # by default instead of doing more work than native APC.
-    min_saved_tokens: int = 8192
-    max_apc_prefix_to_hit_ratio: float = 8.0
+    # Profitability thresholds are workload-specific. Keep library defaults
+    # neutral and let deployment/benchmark profiles opt into stricter gates.
+    min_saved_tokens: int = 0
+    max_apc_prefix_to_hit_ratio: float = 0.0
     check_layers: tuple[int, ...] = (1,)
     recompute_ratios: tuple[float, ...] = (0.15,)
     save_decode_cache: bool = False
-    async_prefetch: bool = True
-    async_fingerprint: bool = True
     tp_global_selection: bool = True
     event_pipeline: bool = True
     fused_segment_copy: bool = True
     cache_attention_mask: bool = True
+    lookup_timeout_ms: int = 10_000
+    store_workers: int = 1
+    max_inflight_store_batches: int = 8
     strict_version_check: bool = True
     ipc_root: str = "/tmp/cacheblend-v1"
     model_scope: str | None = None
@@ -58,6 +58,12 @@ class CacheBlendConfig:
             raise ValueError("min_hit_ratio must be between 0 and 1")
         if self.max_apc_prefix_to_hit_ratio < 0:
             raise ValueError("max_apc_prefix_to_hit_ratio cannot be negative")
+        if self.lookup_timeout_ms <= 0:
+            raise ValueError("lookup_timeout_ms must be positive")
+        if self.store_workers <= 0:
+            raise ValueError("store_workers must be positive")
+        if self.max_inflight_store_batches <= 0:
+            raise ValueError("max_inflight_store_batches must be positive")
         if not self.check_layers:
             raise ValueError("at least one check layer is required")
         if len(self.recompute_ratios) not in (1, len(self.check_layers)):

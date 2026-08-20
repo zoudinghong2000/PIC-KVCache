@@ -9,7 +9,13 @@ VLLM_PORT="${VLLM_PORT:-8123}"
 VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-2,3}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 LOCAL_CPU_GB="${LOCAL_CPU_GB:-1}"
+MIN_SAVED_TOKENS="${MIN_SAVED_TOKENS:-0}"
+MAX_APC_PREFIX_TO_HIT_RATIO="${MAX_APC_PREFIX_TO_HIT_RATIO:-0.0}"
+LOOKUP_TIMEOUT_MS="${LOOKUP_TIMEOUT_MS:-10000}"
+STORE_WORKERS="${STORE_WORKERS:-1}"
+MAX_INFLIGHT_STORE_BATCHES="${MAX_INFLIGHT_STORE_BATCHES:-8}"
 REQUESTS_FILE="${REQUESTS_FILE:-}"
 REPLAY_SCRIPT="${REPLAY_SCRIPT:-/home/zdh/mcts_kv_replay/replay_tree.py}"
 REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-1800}"
@@ -34,10 +40,10 @@ export VLLM_USE_V1=1
 export VLLM_PLUGINS=ascend,ascend_kv_connector,ascend_model_loader,ascend_service_profiling,cacheblend_models
 export PYTHONHASHSEED=0
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_BUFFSIZE=512
-export OMP_PROC_BIND=false
-export OMP_NUM_THREADS=1
-export TASK_QUEUE_ENABLE=1
+export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-512}"
+export OMP_PROC_BIND="${OMP_PROC_BIND:-false}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy="$NO_PROXY"
 
@@ -68,7 +74,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":8192,\"max_apc_prefix_to_hit_ratio\":8.0,\"check_layers\":[1],\"recompute_ratios\":[0.15],\"async_prefetch\":true,\"async_fingerprint\":true,\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true}}"
+KV_CONFIG="{\"kv_connector\":\"CacheBlendConnectorV1\",\"kv_connector_module_path\":\"cacheblend_vllm.connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"chunk_size\":256,\"local_cpu_gb\":${LOCAL_CPU_GB},\"min_retrieve_tokens\":256,\"min_hit_ratio\":0.10,\"min_saved_tokens\":${MIN_SAVED_TOKENS},\"max_apc_prefix_to_hit_ratio\":${MAX_APC_PREFIX_TO_HIT_RATIO},\"check_layers\":[1],\"recompute_ratios\":[0.15],\"tp_global_selection\":true,\"event_pipeline\":true,\"fused_segment_copy\":true,\"cache_attention_mask\":true,\"lookup_timeout_ms\":${LOOKUP_TIMEOUT_MS},\"store_workers\":${STORE_WORKERS},\"max_inflight_store_batches\":${MAX_INFLIGHT_STORE_BATCHES}}}"
 
 setsid vllm serve "$MODEL" \
   --host 127.0.0.1 \
@@ -79,7 +85,7 @@ setsid vllm serve "$MODEL" \
   --enable-expert-parallel \
   --seed 0 \
   --max-model-len "$MAX_MODEL_LEN" \
-  --max-num-seqs 1 \
+  --max-num-seqs "$MAX_NUM_SEQS" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --gpu-memory-utilization 0.85 \
   --trust-remote-code \
