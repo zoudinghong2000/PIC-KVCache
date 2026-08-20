@@ -94,8 +94,9 @@ MODEL=/path/to/model \
 bash benchmarks/cacheblend/run_suite.sh
 ```
 
-Trace durations are host-side function/enqueue times. They do **not** force NPU
-synchronization and therefore are not kernel execution times. Use `msprof` or a
+Most trace durations are host-side function/enqueue times and are not kernel
+execution times. `save_store_wait_finished` is the exception: it includes the
+synchronized single-Store completion boundary. Use `msprof` or a
 PyTorch/torch-npu profiler after the host trace identifies a suspicious layer
 or transfer stage.
 

@@ -110,17 +110,19 @@ worker 在 `start_load_kv()` 创建 `PagedBlendLoader`，随后
 
 ### 6. 未命中请求如何保存 KV
 
-保存不是“请求结束后把整个 cache 同步拷回 CPU”，而是分层流水：
+保存使用与 LMCache 一致的单 Store stream 分层流水：
 
-1. `save_kv_layer()` 在高优先级 gather stream 从 vLLM pages 聚合完整 chunk；
-2. gather 结果进入独立连续 NPU staging，之后不再占用 vLLM pages；
-3. `wait_for_save()` 只让 serving stream 等到最后一次 page gather 安全结束；
-4. 普通优先级 offload stream 等 forward barrier 后执行 NPU->pinned CPU；
-5. 后台线程等 D2H event，再把 host tensor view 发布给 `LocalPinnedCPUStore`；
+1. `save_kv_layer()` 让 Store stream 等待当前 serving stream 的层计算；
+2. Store stream 从 vLLM pages gather 完整 chunk 到连续 NPU staging；
+3. 同一条 Store stream 紧接着执行 NPU->pinned CPU，不再切换第二条保存 stream；
+4. 后台线程等待该层的 Store event，再把 host tensor view 发布给
+   `LocalPinnedCPUStore`；
+5. `wait_for_save()` 同步 Store stream，并等待本批 host publication 完成；
 6. 一个 chunk 的**所有模型层**都写完后才向 matcher 注册，查询永远看不到半成品。
 
 这条链路解决两个正确性条件：vLLM 可以安全复用原 pages；后续请求只会命中完整
-KV。它也让 D2H 尽量离开当前 miss 请求的 TTFT 关键路径。
+KV。与之前 Gather + Offload 双 stream 不同，保存完成现在是明确的请求边界，后续
+请求无需依赖经验性的 sleep 等待 cache ready。
 
 ## Trace 事件如何对应代码
 
@@ -133,15 +135,16 @@ KV。它也让 D2H 尽量离开当前 miss 请求的 TTFT 关键路径。
 | `layer_prefetch_wait_enqueued` | worker，`get()` | compute stream 是否建立了预取依赖 |
 | `layer_compute_enqueued` | worker，executor loop | 每层实际选择了多少 token 进入重算 |
 | `layer_committed` | worker，`commit()` | 哪些层已经把 suffix scatter 回 vLLM pages |
-| `save_gather_enqueued` | worker，`save_kv_layer()` | 每层保存多少 chunk/token，以及 gather 的 host enqueue 开销 |
-| `save_gather_barrier_enqueued` | worker，`wait_for_save()` | 当前 step 有多少 D2H 待启动 |
-| `save_offload_enqueued/finished` | worker，保存线程 | D2H + 后台发布何时完成，是否形成积压 |
+| `save_store_enqueued` | worker，`save_kv_layer()` | 单 Store stream 上 gather + D2H 的 host enqueue 开销 |
+| `save_store_finished` | worker，保存线程 | 每层 Store event 完成并发布 host view 的时间 |
+| `save_store_wait_finished` | worker，`wait_for_save()` | Store stream 与本批 host publication 的阻塞时间 |
 
 `analyze.py` 会把所有进程的 JSONL 按 wall-clock 时间排序，并按 request ID 写出
 `pipeline_timeline.jsonl`。分析器会用 `records.jsonl` 中的 response ID 补上 phase、
 name、TTFT 和相对客户端起点的时间，并排除 warmup 事件。TP worker 事件每个 rank
-各有一份，这是正常现象，也可以借此发现 rank skew。事件时间只能判断先后、重叠
-和 host 延迟；NPU 操作是异步 enqueue，不能把这些 duration 相加当作 kernel 总耗时。
+各有一份，这是正常现象，也可以借此发现 rank skew。除
+`save_store_wait_finished` 包含同步 Store 完成时间以外，其余事件时间主要用于判断
+先后、重叠和 host enqueue 延迟；不能把这些 duration 相加当作 kernel 总耗时。
 
 ## 按顺序寻找优化点
 
@@ -157,9 +160,9 @@ name、TTFT 和相对客户端起点的时间，并排除 warmup 事件。TP wor
    若 compute 经常等 load，再考虑更大的融合传输或 native transfer kernel。
 5. **调选择性重算**：改变 `check_layers`、`recompute_ratios`，同时观察 TTFT 和
    任务质量；比例越低不一定越好，错误 KV 会传到后续层。
-6. **看保存反压**：populate 后紧接 blend 时，后者可能早于所有 D2H commit。
-   增大 settle 只能用于诊断；真正优化应减少复制、调 stream 优先级或实施显式
-   cache-ready 协议。
+6. **看保存反压**：`save_store_wait_finished` 直接进入未命中请求延迟。若它很大，
+   检查单 Store stream 上 gather/D2H 的带宽、staging 数量和 serving 竞争；此时
+   不再需要用 sleep 猜测 cache 是否 ready。
 7. **检查 APC 交互**：`apc_prefix_tokens` 很大时应让 APC 接管；避免为很少的
    interior hits 再跑整段 side forward。
 8. **最后才 profile kernel**：host trace 定位到 load、attention、scatter 或 D2H

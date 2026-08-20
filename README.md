@@ -127,9 +127,11 @@ It records per-phase TTFT/metrics and can emit an opt-in scheduler/worker
 pipeline trace. See [the benchmark guide](benchmarks/cacheblend/README.md) and
 [the Chinese pipeline walkthrough](docs/BENCHMARK_WALKTHROUGH.md).
 
-## Validated result
+## Historical validated result
 
-The standalone plugin was validated on 509 ordered requests using
+The following result was recorded at commit `8a25680`, before writeback was
+changed to the LMCache-style single Store stream. The standalone plugin was
+validated on 509 ordered requests using
 Qwen3-30B-A3B, Ascend TP2/EP2, PP1, 98,304 maximum model length, and a 16 GiB
 per-rank CPU cache. All 509 requests completed without an error. The records
 reported a 1,754,152-token external CacheBlend allocation span and 10,909,568
@@ -142,13 +144,12 @@ span and can include recomputed gaps; it is not the exact-hit count.
 | LMCache-based CacheBlend baseline | 307.462 s | 0.349 s | 1.512 s | 2.776 s | 1,858,313 |
 | Native APC baseline | 337.026 s | 0.269 s | 2.009 s | 4.285 s | n/a |
 
-These are single-run acceptance figures, not a general benchmark. Profitability
-gating, direct segment-to-NPU staging, suffix-only persistent TP lookup, and
-two-stream asynchronous writeback cut the plugin's previous 378.334-second
-result by 16.1%. It is 5.8% faster than native APC on this trace and remains
-3.3% above the LMCache-based implementation. Compared with the immediately
-preceding 320.827-second plugin run, decoupling paged-KV gather from background
-D2H reduced total TTFT by 1.0% while completing all requests without an error.
+These are single-run acceptance figures, not a general benchmark. They are
+retained as a historical comparison and must not be attributed to the current
+writeback implementation. Current main uses one Store stream for paged-KV
+gather and D2H, and makes `wait_for_save()` an explicit Store-completion and
+cache-publication boundary. Re-run the benchmark suite for a current
+apples-to-apples performance result.
 
 ## Provenance
 

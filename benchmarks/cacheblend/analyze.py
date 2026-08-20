@@ -247,8 +247,9 @@ def main() -> None:
                 f"## Pipeline trace: {name}",
                 "",
                 (
-                    "These are host scheduling/enqueue durations, not synchronized NPU "
-                    "kernel durations. Overlapping stages must not be added together."
+                    "Most values are host scheduling/enqueue durations; "
+                    "`save_store_wait_finished` includes synchronized Store completion. "
+                    "Overlapping stages must not be added together."
                 ),
                 "",
                 "### Lookup plans",

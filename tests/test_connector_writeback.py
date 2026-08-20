@@ -2,6 +2,7 @@ import gc
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import torch
 
@@ -12,9 +13,17 @@ from cacheblend_vllm.trace import PipelineTracer
 class RecordingStream:
     def __init__(self):
         self.events = []
+        self.streams = []
+        self.synchronize_calls = 0
 
     def wait_event(self, event):
         self.events.append(event)
+
+    def wait_stream(self, stream):
+        self.streams.append(stream)
+
+    def synchronize(self):
+        self.synchronize_calls += 1
 
 
 class BlockingEvent:
@@ -30,9 +39,13 @@ class BlockingEvent:
 class RecordingEvent:
     def __init__(self):
         self.recorded_on = None
+        self.synchronize_calls = 0
 
     def record(self, stream):
         self.recorded_on = stream
+
+    def synchronize(self):
+        self.synchronize_calls += 1
 
 
 class RecordingStore:
@@ -48,54 +61,83 @@ class RecordingStore:
         self.cancelled.append((segment_id, layer_id))
 
 
-def test_wait_for_save_only_orders_paged_gather(monkeypatch):
+class RecordingTracer:
+    enabled = True
+
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event, request_id=None, **fields):
+        self.events.append((event, request_id, fields))
+
+
+def test_wait_for_save_synchronizes_single_store_stream():
     connector = object.__new__(CacheBlendConnectorV1)
-    gather_event = object()
-    current_stream = RecordingStream()
-    connector._last_gather_event = gather_event
-    connector._pending_offloads = []
+    store_stream = RecordingStream()
+    connector._store_stream = store_stream
     connector._trace = PipelineTracer("test")
     connector._save_lock = threading.Lock()
     connector._save_futures = set()
-    monkeypatch.setattr(torch.npu, "current_stream", lambda: current_stream)
+    connector._pending_store_request_ids = set()
 
     connector.wait_for_save()
 
-    assert current_stream.events == [gather_event]
-    assert connector._last_gather_event is None
+    assert store_stream.synchronize_calls == 1
+    assert connector._save_futures == set()
 
 
-def test_wait_for_save_defers_d2h_behind_end_of_forward_barrier(monkeypatch):
+def test_enqueue_store_gathers_and_offloads_on_one_stream(monkeypatch):
     connector = object.__new__(CacheBlendConnectorV1)
-    gather_event = object()
-    current_stream = RecordingStream()
-    contiguous = torch.empty(1)
-    pending = [("segment", 0, 1)]
-    connector._last_gather_event = gather_event
-    connector._pending_offloads = [("request", pending, contiguous, 123)]
-    connector._trace = PipelineTracer("test")
+    connector._store = RecordingStore()
+    connector._store_stream = RecordingStream()
+    connector._trace = RecordingTracer()
     connector._save_lock = threading.Lock()
     connector._save_futures = set()
-    enqueued = []
+    connector._pending_store_request_ids = set()
+    connector._save_slots = threading.Semaphore(2)
+    connector._save_pool = ThreadPoolExecutor(max_workers=1)
+    connector.block_size = 2
+    serving_stream = RecordingStream()
+    events = []
+    original_empty = torch.empty
 
-    monkeypatch.setattr(torch.npu, "current_stream", lambda: current_stream)
-    monkeypatch.setattr(torch.npu, "Event", RecordingEvent)
+    def make_event():
+        event = RecordingEvent()
+        events.append(event)
+        return event
+
+    def unpinned_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return original_empty(*args, **kwargs)
+
+    gathered = torch.arange(8).reshape(2, 4)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: serving_stream)
+    monkeypatch.setattr(torch.npu, "stream", lambda stream: nullcontext(stream))
+    monkeypatch.setattr(torch.npu, "Event", make_event)
+    monkeypatch.setattr(torch, "empty", unpinned_empty)
     monkeypatch.setattr(
-        connector,
-        "_save_contiguous_batch",
-        lambda batch, source, ready_event=None, **kwargs: enqueued.append(
-            (batch, source, ready_event, kwargs)
-        ),
+        "cacheblend_vllm.connector.gather_paged_kv",
+        lambda kv_layer, slots, block_size: gathered,
     )
 
+    connector._enqueue_store_batch(
+        [("segment", 0, 4)],
+        object(),
+        torch.arange(4),
+        request_id="request",
+    )
     connector.wait_for_save()
+    connector._save_pool.shutdown()
 
-    assert current_stream.events == [gather_event]
-    assert connector._pending_offloads == []
-    assert enqueued[0][0] is pending
-    assert enqueued[0][1] is contiguous
-    assert enqueued[0][2].recorded_on is current_stream
-    assert enqueued[0][3]["request_id"] == "request"
+    assert connector._store_stream.streams == [serving_stream]
+    assert connector._store_stream.synchronize_calls == 1
+    assert events[0].recorded_on is connector._store_stream
+    assert events[0].synchronize_calls == 1
+    assert torch.equal(connector._store.layers[0][2], gathered)
+    assert any(
+        event == "save_store_wait_finished" and request_id == "request"
+        for event, request_id, _ in connector._trace.events
+    )
 
 
 def test_async_publish_holds_device_staging_until_offload_completes():

@@ -1,8 +1,9 @@
 """Opt-in JSONL tracing for the CacheBlend data pipeline.
 
-Tracing is disabled unless ``CACHEBLEND_TRACE_DIR`` is set.  The trace records
-host-side scheduling/enqueue events; it intentionally does not synchronize NPU
-streams just to obtain timings.
+Tracing is disabled unless ``CACHEBLEND_TRACE_DIR`` is set. Most records are
+host-side scheduling/enqueue events. The save-wait record measures the
+connector's existing Store synchronization boundary; tracing never adds an NPU
+synchronization solely to obtain timings.
 """
 
 from __future__ import annotations

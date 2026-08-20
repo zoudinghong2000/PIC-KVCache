@@ -52,14 +52,15 @@ implementation; it is not a forward hook.
    across TP ranks, and always retains gap tokens.
 8. Each completed layer is scattered into the vLLM-owned paged cache. The
    regular vLLM forward then computes the remaining prompt token and logits.
-9. Complete prompt chunks are gathered once per layer into independent staging
-   on a high-priority NPU stream. At the end of the forward, the serving stream
-   waits only for the final gather event, which makes vLLM's paged blocks safe
-   to reuse. D2H is then enqueued behind an end-of-forward barrier on a separate
-   default-priority stream and completes in the background. Chunk identities
-   are hashed once per request, and stored tensor views retain their pinned
-   batch owner to avoid a second CPU copy. Fingerprints are published atomically
-   only after every layer's D2H has completed.
+9. Complete prompt chunks are saved layerwise on one default-priority Store
+   stream, matching LMCache's topology. For each layer, Store waits for the
+   serving/current stream, gathers vLLM's paged KV into contiguous staging, and
+   immediately queues D2H on that same stream. `wait_for_save` synchronizes the
+   Store stream and host publication, so vLLM's pages are safe to reuse and the
+   new cache is visible before the request leaves the save boundary. Chunk
+   identities are hashed once per request, and stored tensor views retain their
+   pinned batch owner to avoid a second CPU copy. Fingerprints are published
+   atomically only after every layer's D2H has completed.
 
 The loader double-buffers its per-layer staging tensors. An event prevents a
 buffer from being reused until its previous layer has been scattered into the
@@ -71,15 +72,16 @@ without importing its runtime or rebuilding a fused CPU tensor for every layer.
 For writeback, the Ascend paged-cache operator writes K and V directly into the
 two planes of a single staging allocation. The asynchronous Future retains that
 device allocation until its D2H event completes, so allocator reuse cannot race
-the offload stream.
+the Store stream. Serving, Load, and Store are the only NPU stream roles owned
+by the data path.
 
 ## Correctness invariants
 
 - Fingerprint collisions are verified against the complete token chunk.
 - Match segments are sorted, non-overlapping, and never overlap the APC prefix.
 - A cache entry is not discoverable until all layers have committed.
-- vLLM paged blocks are not reusable until the gather stream has stopped
-  reading them; CPU writeback completion is not on the serving-stream path.
+- vLLM paged blocks are not reusable until the Store stream has completed its
+  paged reads; `wait_for_save` also waits for D2H and host publication.
 - TP uses an exact segment intersection; a partial-rank hit is a miss.
 - In-flight entries are pinned and cannot be evicted.
 - APC pages are gathered as attention context but never overwritten by the
